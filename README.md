@@ -35,3 +35,8 @@ Include `<nivo/nivo.h>` to get started. See the [basic example](examples/basic.c
 ## Documentation
 
 See [API semantics](docs/api-semantics.md) for handle lifetimes, writes, expiration, and capacity rules.
+
+## Performance comparison
+
+The reproducible Google Benchmark suite and the cumulative NivoCache versus
+CacheLib result table are in [benchmarks](benchmarks/README.md).

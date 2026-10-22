@@ -227,10 +227,13 @@ Result<WriteHandle> Cache::allocate(PoolId pool, std::string_view key, std::size
     ++p.counters.allocation_failures;
     return Status::resource_exhausted;
   }
-  Impl::prune(p, impl_->config.clock->now());
-  if (!Impl::make_room(p, p.config.capacity_bytes - charge, key)) {
-    ++p.counters.allocation_failures;
-    return Status::resource_exhausted;
+  const std::size_t target = p.config.capacity_bytes - charge;
+  if (p.budget->used.load(std::memory_order_relaxed) > target) {
+    Impl::prune(p, impl_->config.clock->now());
+    if (!Impl::make_room(p, target, key)) {
+      ++p.counters.allocation_failures;
+      return Status::resource_exhausted;
+    }
   }
   std::shared_ptr<detail::Entry> entry = std::make_shared<detail::Entry>();
   entry->owner = impl_->owner;

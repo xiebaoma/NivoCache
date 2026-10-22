@@ -11,7 +11,12 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
 endif()
 option(NIVO_BUILD_TESTS "Build contract tests" ${nivo_top_level})
 option(NIVO_BUILD_EXAMPLES "Build examples" ${nivo_top_level})
-option(NIVO_BUILD_BENCHMARKS "Build the baseline benchmark" OFF)
+option(NIVO_BUILD_BENCHMARKS "Build Google Benchmark performance tests" OFF)
+option(NIVO_BENCHMARK_WITH_CACHELIB "Include CacheLib in performance tests" OFF)
+option(NIVO_BENCHMARK_FETCH_GOOGLE_BENCHMARK
+  "Fetch the pinned Google Benchmark instead of using an installed package" ON)
+set(NIVO_BENCHMARK_CACHELIB_REVISION "unknown" CACHE STRING
+  "CacheLib revision recorded in benchmark output")
 
 add_library(nivo_cache src/cache.cpp)
 add_library(Nivo::cache ALIAS nivo_cache)
@@ -41,8 +46,53 @@ if(NIVO_BUILD_EXAMPLES)
   endif()
 endif()
 if(NIVO_BUILD_BENCHMARKS)
-  add_executable(nivo_bench benchmarks/cache_bench.cpp)
-  target_link_libraries(nivo_bench PRIVATE Nivo::cache)
+  if(NOT TARGET benchmark::benchmark)
+    if(NIVO_BENCHMARK_FETCH_GOOGLE_BENCHMARK)
+      include(FetchContent)
+      set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+      set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+      FetchContent_Declare(google_benchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG 31c66f47f60d06790a4885a261d682ba339bd100
+        GIT_SHALLOW TRUE)
+      FetchContent_MakeAvailable(google_benchmark)
+    else()
+      find_package(benchmark 1.8 CONFIG REQUIRED)
+    endif()
+  endif()
+
+  add_executable(nivo_cache_bench benchmarks/cache_bench.cpp)
+  target_link_libraries(nivo_cache_bench PRIVATE Nivo::cache benchmark::benchmark)
+
+  execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE nivo_benchmark_revision
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(NOT nivo_benchmark_revision)
+    set(nivo_benchmark_revision unknown)
+  endif()
+  target_compile_definitions(nivo_cache_bench PRIVATE
+    NIVO_BENCHMARK_NIVO_REVISION="${nivo_benchmark_revision}"
+    NIVO_BENCHMARK_CACHELIB_REVISION="${NIVO_BENCHMARK_CACHELIB_REVISION}"
+    NIVO_BENCHMARK_COMPILER="${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}")
+
+  if(NIVO_BENCHMARK_WITH_CACHELIB)
+    find_package(cachelib CONFIG REQUIRED)
+    target_compile_definitions(nivo_cache_bench PRIVATE
+      NIVO_BENCHMARK_WITH_CACHELIB=1)
+    if(TARGET cachelib::cachelib)
+      target_link_libraries(nivo_cache_bench PRIVATE cachelib::cachelib)
+    elseif(TARGET cachelib)
+      target_link_libraries(nivo_cache_bench PRIVATE cachelib)
+    else()
+      message(FATAL_ERROR "The CacheLib package did not export a cachelib target")
+    endif()
+  else()
+    target_compile_definitions(nivo_cache_bench PRIVATE
+      NIVO_BENCHMARK_WITH_CACHELIB=0)
+  endif()
 endif()
 
 set(nivo_package_dir ${CMAKE_INSTALL_LIBDIR}/cmake/NivoCache)

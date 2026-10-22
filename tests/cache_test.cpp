@@ -158,6 +158,30 @@ void expiry_maintenance() {
   f.clock->advance(1ms);
   CHECK(f.cache->peek(f.pool, "a").status() == Status::not_found);
 }
+void allocation_prunes_only_under_pressure() {
+  Fixture roomy(64);
+  roomy.put("expired", "value", {.ttl = 1ms});
+  roomy.clock->advance(1ms);
+  nivo::Result<nivo::WriteHandle> roomy_draft =
+      roomy.cache->allocate(roomy.pool, "new", 1);
+  CHECK(roomy_draft);
+  CHECK(roomy.cache->pool_stats(roomy.pool).value().indexed_items == 1);
+  CHECK(roomy.cache->pool_stats(roomy.pool).value().counters.expirations == 0);
+  CHECK(roomy.cache->prune_expired(roomy.pool).value() == 1);
+
+  Fixture pressured(4);
+  pressured.put("a", "1", {.ttl = 1ms});
+  pressured.put("b", "1");
+  pressured.clock->advance(1ms);
+  nivo::Result<nivo::WriteHandle> pressured_draft =
+      pressured.cache->allocate(pressured.pool, "c", 1);
+  CHECK(pressured_draft);
+  nivo::PoolStats stats = pressured.cache->pool_stats(pressured.pool).value();
+  CHECK(stats.indexed_items == 1);
+  CHECK(stats.counters.expirations == 1);
+  CHECK(stats.counters.evictions == 0);
+  CHECK(pressured.cache->peek(pressured.pool, "b"));
+}
 void lru_and_peek() {
   Fixture f(6);
   f.put("a", "a"); f.put("b", "b"); f.put("c", "c");
@@ -375,6 +399,7 @@ int main() {
     {"configuration", configuration}, {"unpublished_and_aborted", unpublished_and_aborted},
     {"publish_and_snapshot", publish_and_snapshot}, {"write_conditions_and_retry", write_conditions_and_retry},
     {"ttl_boundary_and_publish_time", ttl_boundary_and_publish_time}, {"expiry_maintenance", expiry_maintenance},
+    {"allocation_prunes_only_under_pressure", allocation_prunes_only_under_pressure},
     {"lru_and_peek", lru_and_peek}, {"fifo_policy", fifo_policy},
     {"pins_and_capacity", pins_and_capacity}, {"update_protects_old_key", update_protects_old_key},
     {"eviction_skips_pins", eviction_skips_pins}, {"pool_isolation_resize", pool_isolation_resize},
