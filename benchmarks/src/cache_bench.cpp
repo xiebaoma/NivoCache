@@ -129,7 +129,9 @@ class CacheLibAdapter final {
 
   CacheLibAdapter() : cache_(make_config()) {
     Cache::MMConfig mm_config(0, true, true);
-    pool_ = cache_.addPool("benchmark", kCacheCapacityBytes, {}, mm_config);
+    const std::size_t usable_capacity =
+        cache_.getCacheMemoryStats().ramCacheSize;
+    pool_ = cache_.addPool("benchmark", usable_capacity, {}, mm_config);
     populate();
   }
 

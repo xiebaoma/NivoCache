@@ -61,7 +61,7 @@ if(NIVO_BUILD_BENCHMARKS)
     endif()
   endif()
 
-  add_executable(nivo_cache_bench benchmarks/cache_bench.cpp)
+  add_executable(nivo_cache_bench benchmarks/src/cache_bench.cpp)
   target_link_libraries(nivo_cache_bench PRIVATE Nivo::cache benchmark::benchmark)
 
   execute_process(
@@ -79,7 +79,13 @@ if(NIVO_BUILD_BENCHMARKS)
     NIVO_BENCHMARK_COMPILER="${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}")
 
   if(NIVO_BENCHMARK_WITH_CACHELIB)
+    find_package(GTest CONFIG REQUIRED)
+    find_package(NUMA REQUIRED)
+    find_package(magic_enum CONFIG REQUIRED)
     find_package(cachelib CONFIG REQUIRED)
+    get_filename_component(cachelib_include_root "${CACHELIB_INCLUDE_DIR}" DIRECTORY)
+    target_include_directories(nivo_cache_bench SYSTEM PRIVATE
+      "${cachelib_include_root}")
     target_compile_definitions(nivo_cache_bench PRIVATE
       NIVO_BENCHMARK_WITH_CACHELIB=1)
     if(TARGET cachelib::cachelib)

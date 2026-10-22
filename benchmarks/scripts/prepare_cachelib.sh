@@ -3,8 +3,8 @@ set -euo pipefail
 
 readonly CACHELIB_COMMIT="f4012d692d849d1ae9927dd17ea186fb45f6ef00"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-readonly WORK_ROOT="${1:-${REPOSITORY_ROOT}/build/cachelib-dependency}"
+readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+readonly WORK_ROOT="${1:-${REPOSITORY_ROOT}/../cachelib-dependency}"
 readonly SOURCE_DIR="${WORK_ROOT}/source"
 readonly SCRATCH_DIR="${WORK_ROOT}/scratch"
 readonly INSTALL_DIR="${WORK_ROOT}/install"
@@ -31,8 +31,10 @@ readonly GETDEPS_OPTIONS=(
   --allow-system-packages
 )
 
-python3 "${GETDEPS}" "${GETDEPS_OPTIONS[@]}" build cachelib --build-type Release
-python3 "${GETDEPS}" "${GETDEPS_OPTIONS[@]}" env cachelib > "${ENV_FILE}"
+python3 "${GETDEPS}" "${GETDEPS_OPTIONS[@]}" build cachelib \
+  --build-type Release --no-tests --src-dir "${SOURCE_DIR}"
+python3 "${GETDEPS}" env "${GETDEPS_OPTIONS[@]}" \
+  --src-dir "${SOURCE_DIR}" cachelib > "${ENV_FILE}"
 
 echo "CacheLib ${CACHELIB_COMMIT} is ready."
 echo "Environment: ${ENV_FILE}"
