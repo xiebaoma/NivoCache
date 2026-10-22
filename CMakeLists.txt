@@ -1,0 +1,56 @@
+cmake_minimum_required(VERSION 3.20)
+project(NivoCache LANGUAGES CXX)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+find_package(Threads REQUIRED)
+set(nivo_top_level OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(nivo_top_level ON)
+endif()
+option(NIVO_BUILD_TESTS "Build contract tests" ${nivo_top_level})
+option(NIVO_BUILD_EXAMPLES "Build examples" ${nivo_top_level})
+option(NIVO_BUILD_BENCHMARKS "Build the baseline benchmark" OFF)
+
+add_library(nivo_cache src/cache.cpp)
+add_library(Nivo::cache ALIAS nivo_cache)
+set_target_properties(nivo_cache PROPERTIES EXPORT_NAME cache CXX_EXTENSIONS OFF
+  POSITION_INDEPENDENT_CODE ON)
+target_compile_features(nivo_cache PUBLIC cxx_std_20)
+target_include_directories(nivo_cache PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(nivo_cache PUBLIC Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(nivo_cache PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+if(NIVO_BUILD_TESTS)
+  enable_testing()
+  add_executable(nivo_contract_tests tests/cache_test.cpp)
+  target_link_libraries(nivo_contract_tests PRIVATE Nivo::cache)
+  add_test(NAME nivo.contract COMMAND nivo_contract_tests)
+  set_tests_properties(nivo.contract PROPERTIES TIMEOUT 60)
+endif()
+if(NIVO_BUILD_EXAMPLES)
+  add_executable(nivo_basic examples/basic.cpp)
+  target_link_libraries(nivo_basic PRIVATE Nivo::cache)
+  if(NIVO_BUILD_TESTS)
+    add_test(NAME nivo.example COMMAND nivo_basic)
+  endif()
+endif()
+if(NIVO_BUILD_BENCHMARKS)
+  add_executable(nivo_bench benchmarks/cache_bench.cpp)
+  target_link_libraries(nivo_bench PRIVATE Nivo::cache)
+endif()
+
+set(nivo_package_dir ${CMAKE_INSTALL_LIBDIR}/cmake/NivoCache)
+install(TARGETS nivo_cache EXPORT NivoCacheTargets)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT NivoCacheTargets NAMESPACE Nivo:: DESTINATION ${nivo_package_dir})
+configure_package_config_file(cmake/NivoCacheConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/NivoCacheConfig.cmake
+  INSTALL_DESTINATION ${nivo_package_dir})
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/NivoCacheConfig.cmake
+  DESTINATION ${nivo_package_dir})

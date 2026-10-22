@@ -1,0 +1,13 @@
+{
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+  "C_Cpp.default.includePath": ["${workspaceFolder}/include"],
+  "C_Cpp.default.browse.path": ["${workspaceFolder}/include", "${workspaceFolder}/src"],
+  "C_Cpp.files.exclude": {
+    "**/build/**": true,
+    "**/install/**": true
+  },
+  "files.exclude": {
+    "build": true,
+    "install": true
+  }
+}
