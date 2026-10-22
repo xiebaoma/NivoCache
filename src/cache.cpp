@@ -69,23 +69,25 @@ void accumulate(Counters& a, const Counters& b) {
 
 struct Cache::Impl {
   using Queue = std::list<std::shared_ptr<detail::Entry>>;
+  using Index = std::map<std::string, Queue::iterator, std::less<>>;
   struct Pool {
     PoolId id;
     PoolConfig config;
     std::shared_ptr<detail::Budget> budget = std::make_shared<detail::Budget>();
     Queue queue;  // front = most recent
-    std::map<std::string, Queue::iterator, std::less<>> index;
+    Index index;
     std::size_t indexed_bytes = 0;
     Counters counters;
     Pool(PoolId id_, PoolConfig config_) : id(id_), config(std::move(config_)) {}
   };
+  using PoolMap = std::map<PoolId, Pool>;
   explicit Impl(CacheConfig config_) : config(std::move(config_)) {
     if (!config.clock) config.clock = std::make_shared<SteadyClock>();
   }
   CacheConfig config;
   std::shared_ptr<const detail::Owner> owner = std::make_shared<detail::Owner>();
   mutable std::mutex mutex;
-  std::map<PoolId, Pool> pools;
+  PoolMap pools;
   std::size_t assigned = 0;
   PoolId last_pool = 0;
   Version last_version = 0;
@@ -104,15 +106,15 @@ struct Cache::Impl {
   }
   static std::size_t prune(Pool& p, Duration now) {
     std::size_t count = 0;
-    for (auto it = p.queue.begin(); it != p.queue.end();) {
-      auto candidate = it++;
+    for (Queue::iterator it = p.queue.begin(); it != p.queue.end();) {
+      Queue::iterator candidate = it++;
       if (expired(**candidate, now)) { unlink(p, candidate); ++count; }
     }
     p.counters.expirations += count;
     return count;
   }
   static void expire_key(Pool& p, std::string_view key, Duration now) {
-    auto it = p.index.find(key);
+    Index::iterator it = p.index.find(key);
     if (it != p.index.end() && expired(**it->second, now)) {
       unlink(p, it->second);
       ++p.counters.expirations;
@@ -120,11 +122,11 @@ struct Cache::Impl {
   }
   // target is the maximum total charge allowed before the new reservation.
   static bool make_room(Pool& p, std::size_t target, std::string_view protected_key) {
-    auto it = p.queue.end();
+    Queue::iterator it = p.queue.end();
     while (p.budget->used.load(std::memory_order_relaxed) > target && it != p.queue.begin()) {
       --it;
       if ((*it)->key != protected_key && it->use_count() == 1) {
-        auto victim = it++;
+        Queue::iterator victim = it++;
         unlink(p, victim);
         ++p.counters.evictions;
       }
@@ -153,14 +155,14 @@ Result<PoolId> Cache::add_pool(PoolConfig config) {
   if (config.name.empty() || config.capacity_bytes == 0) return Status::invalid_argument;
   if (config.eviction != EvictionPolicy::lru && config.eviction != EvictionPolicy::fifo)
     return Status::invalid_argument;
-  for (const auto& [id, p] : impl_->pools) {
-    (void)id;
+  for (const Impl::PoolMap::value_type& pool_entry : impl_->pools) {
+    const Impl::Pool& p = pool_entry.second;
     if (p.config.name == config.name) return Status::already_exists;
   }
   if (config.capacity_bytes > impl_->config.capacity_bytes - impl_->assigned ||
       impl_->last_pool == std::numeric_limits<PoolId>::max()) return Status::resource_exhausted;
-  const auto id = impl_->last_pool + 1;
-  const auto capacity = config.capacity_bytes;
+  const PoolId id = impl_->last_pool + 1;
+  const std::size_t capacity = config.capacity_bytes;
   impl_->pools.try_emplace(id, id, std::move(config));
   impl_->last_pool = id;
   impl_->assigned += capacity;
@@ -170,10 +172,10 @@ Status Cache::resize_pool(PoolId pool, std::size_t capacity_bytes) {
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
   if (capacity_bytes == 0) return Status::invalid_argument;
-  auto it = impl_->pools.find(pool);
+  Impl::PoolMap::iterator it = impl_->pools.find(pool);
   if (it == impl_->pools.end()) return Status::pool_not_found;
-  auto& p = it->second;
-  const auto other = impl_->assigned - p.config.capacity_bytes;
+  Impl::Pool& p = it->second;
+  const std::size_t other = impl_->assigned - p.config.capacity_bytes;
   if (capacity_bytes > impl_->config.capacity_bytes - other) return Status::resource_exhausted;
   Impl::prune(p, impl_->config.clock->now());
   if (!Impl::make_room(p, capacity_bytes, {})) return Status::resource_exhausted;
@@ -185,12 +187,14 @@ Result<std::vector<PoolStats>> Cache::pools() const {
   std::lock_guard lock(impl_->mutex);
   std::vector<PoolStats> result;
   result.reserve(impl_->pools.size());
-  for (const auto& [id, p] : impl_->pools) { (void)id; result.push_back(Impl::snapshot(p)); }
+  for (const Impl::PoolMap::value_type& pool_entry : impl_->pools) {
+    result.push_back(Impl::snapshot(pool_entry.second));
+  }
   return result;
 }
 Result<PoolStats> Cache::pool_stats(PoolId pool) const {
   std::lock_guard lock(impl_->mutex);
-  auto it = impl_->pools.find(pool);
+  Impl::PoolMap::const_iterator it = impl_->pools.find(pool);
   if (it == impl_->pools.end()) return Status::pool_not_found;
   return Impl::snapshot(it->second);
 }
@@ -201,8 +205,8 @@ CacheStats Cache::stats() const {
   result.assigned_bytes = impl_->assigned;
   result.pools = impl_->pools.size();
   result.closed = impl_->closed;
-  for (const auto& [id, p] : impl_->pools) {
-    (void)id;
+  for (const Impl::PoolMap::value_type& pool_entry : impl_->pools) {
+    const Impl::Pool& p = pool_entry.second;
     result.allocated_bytes += p.budget->used.load(std::memory_order_relaxed);
     result.indexed_bytes += p.indexed_bytes;
     result.indexed_items += p.index.size();
@@ -215,10 +219,10 @@ Result<WriteHandle> Cache::allocate(PoolId pool, std::string_view key, std::size
   if (impl_->closed) return Status::closed;
   if (!impl_->valid_key(key) || value_size > impl_->config.max_value_bytes ||
       value_size > std::numeric_limits<std::size_t>::max() - key.size()) return Status::invalid_argument;
-  auto it = impl_->pools.find(pool);
+  Impl::PoolMap::iterator it = impl_->pools.find(pool);
   if (it == impl_->pools.end()) return Status::pool_not_found;
-  auto& p = it->second;
-  const auto charge = key.size() + value_size;
+  Impl::Pool& p = it->second;
+  const std::size_t charge = key.size() + value_size;
   if (charge > p.config.capacity_bytes) {
     ++p.counters.allocation_failures;
     return Status::resource_exhausted;
@@ -228,7 +232,7 @@ Result<WriteHandle> Cache::allocate(PoolId pool, std::string_view key, std::size
     ++p.counters.allocation_failures;
     return Status::resource_exhausted;
   }
-  auto entry = std::make_shared<detail::Entry>();
+  std::shared_ptr<detail::Entry> entry = std::make_shared<detail::Entry>();
   entry->owner = impl_->owner;
   entry->budget = p.budget;
   entry->key = key;
@@ -243,13 +247,13 @@ Result<ReadHandle> Cache::publish(WriteHandle&& draft, WriteOptions options) {
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
   if (!draft || draft.entry_->owner != impl_->owner) return Status::invalid_argument;
-  if (auto status = validate(options); status != Status::ok) return status;
-  const auto now = impl_->config.clock->now();
+  if (Status status = validate(options); status != Status::ok) return status;
+  const Duration now = impl_->config.clock->now();
   if (options.ttl.count() > std::numeric_limits<Duration::rep>::max() - now.count())
     return Status::invalid_argument;
-  auto& p = impl_->pools.at(draft.pool());
+  Impl::Pool& p = impl_->pools.at(draft.pool());
   Impl::expire_key(p, draft.key(), now);
-  auto it = p.index.find(draft.key());
+  Impl::Index::iterator it = p.index.find(draft.key());
   const bool exists = it != p.index.end();
   if (options.mode == WriteMode::insert_only && exists) return Status::already_exists;
   if ((options.mode == WriteMode::replace_only || options.mode == WriteMode::compare_exchange) && !exists)
@@ -277,8 +281,8 @@ Result<ReadHandle> Cache::publish(WriteHandle&& draft, WriteOptions options) {
 }
 Result<ReadHandle> Cache::put(PoolId pool, std::string_view key,
                              std::span<const std::byte> value, WriteOptions options) {
-  if (auto status = validate(options); status != Status::ok) return status;
-  auto draft = allocate(pool, key, value.size());
+  if (Status status = validate(options); status != Status::ok) return status;
+  Result<WriteHandle> draft = allocate(pool, key, value.size());
   if (!draft) return draft.status();
   std::copy(value.begin(), value.end(), draft.value().bytes().begin());
   return publish(std::move(draft).value(), options);
@@ -288,11 +292,11 @@ Result<ReadHandle> Cache::lookup(PoolId pool, std::string_view key, bool touch) 
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
   if (!impl_->valid_key(key)) return Status::invalid_argument;
-  auto pool_it = impl_->pools.find(pool);
+  Impl::PoolMap::iterator pool_it = impl_->pools.find(pool);
   if (pool_it == impl_->pools.end()) return Status::pool_not_found;
-  auto& p = pool_it->second;
+  Impl::Pool& p = pool_it->second;
   Impl::expire_key(p, key, impl_->config.clock->now());
-  auto it = p.index.find(key);
+  Impl::Index::iterator it = p.index.find(key);
   if (it == p.index.end()) {
     if (touch) ++p.counters.misses;
     return Status::not_found;
@@ -313,11 +317,11 @@ Status Cache::erase(PoolId pool, std::string_view key, Version expected_version)
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
   if (!impl_->valid_key(key)) return Status::invalid_argument;
-  auto pool_it = impl_->pools.find(pool);
+  Impl::PoolMap::iterator pool_it = impl_->pools.find(pool);
   if (pool_it == impl_->pools.end()) return Status::pool_not_found;
-  auto& p = pool_it->second;
+  Impl::Pool& p = pool_it->second;
   Impl::expire_key(p, key, impl_->config.clock->now());
-  auto it = p.index.find(key);
+  Impl::Index::iterator it = p.index.find(key);
   if (it == p.index.end()) return Status::not_found;
   if (expected_version && (*it->second)->version != expected_version) return Status::version_mismatch;
   Impl::unlink(p, it->second);
@@ -327,9 +331,9 @@ Status Cache::erase(PoolId pool, std::string_view key, Version expected_version)
 Status Cache::clear(PoolId pool) {
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
-  auto it = impl_->pools.find(pool);
+  Impl::PoolMap::iterator it = impl_->pools.find(pool);
   if (it == impl_->pools.end()) return Status::pool_not_found;
-  auto& p = it->second;
+  Impl::Pool& p = it->second;
   p.counters.erases += p.index.size();
   p.index.clear(); p.queue.clear(); p.indexed_bytes = 0;
   return Status::ok;
@@ -337,15 +341,15 @@ Status Cache::clear(PoolId pool) {
 Result<std::size_t> Cache::prune_expired(PoolId pool) {
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
-  auto it = impl_->pools.find(pool);
+  Impl::PoolMap::iterator it = impl_->pools.find(pool);
   if (it == impl_->pools.end()) return Status::pool_not_found;
   return Impl::prune(it->second, impl_->config.clock->now());
 }
 void Cache::close() {
   std::lock_guard lock(impl_->mutex);
   impl_->closed = true;
-  for (auto& [id, p] : impl_->pools) {
-    (void)id;
+  for (Impl::PoolMap::value_type& pool_entry : impl_->pools) {
+    Impl::Pool& p = pool_entry.second;
     p.index.clear(); p.queue.clear(); p.indexed_bytes = 0;
   }
 }

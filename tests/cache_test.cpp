@@ -28,7 +28,7 @@ std::span<const std::byte> bytes(std::string_view s) {
   return std::as_bytes(std::span(s.data(), s.size()));
 }
 std::string text(const nivo::ReadHandle& handle) {
-  auto b = handle.bytes();
+  std::span<const std::byte> b = handle.bytes();
   if (b.empty()) return {};
   return {reinterpret_cast<const char*>(b.data()), b.size()};
 }
@@ -37,10 +37,12 @@ struct Fixture {
   std::unique_ptr<nivo::Cache> cache;
   nivo::PoolId pool;
   explicit Fixture(std::size_t capacity = 1024) {
-    auto result = nivo::Cache::create({.capacity_bytes = capacity * 2, .clock = clock});
+    nivo::Result<std::unique_ptr<nivo::Cache>> result =
+        nivo::Cache::create({.capacity_bytes = capacity * 2, .clock = clock});
     CHECK(result);
     cache = std::move(result).value();
-    auto added = cache->add_pool({.name = "default", .capacity_bytes = capacity});
+    nivo::Result<nivo::PoolId> added =
+        cache->add_pool({.name = "default", .capacity_bytes = capacity});
     CHECK(added);
     pool = added.value();
   }
@@ -65,7 +67,7 @@ void configuration() {
 void unpublished_and_aborted() {
   Fixture f;
   {
-    auto draft = f.cache->allocate(f.pool, "key", 4);
+    nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, "key", 4);
     CHECK(draft && draft.value().charge() == 7);
     CHECK(std::all_of(draft.value().bytes().begin(), draft.value().bytes().end(),
                       [](std::byte b) { return b == std::byte{0}; }));
@@ -77,14 +79,14 @@ void unpublished_and_aborted() {
 }
 void publish_and_snapshot() {
   Fixture f;
-  auto draft = f.cache->allocate(f.pool, "a", 3);
+  nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, "a", 3);
   std::copy(bytes("one").begin(), bytes("one").end(), draft.value().bytes().begin());
-  auto first = f.cache->publish(std::move(draft).value());
+  nivo::Result<nivo::ReadHandle> first = f.cache->publish(std::move(draft).value());
   CHECK(first && !draft.value());
   CHECK(first.value().pool() == f.pool);
   CHECK(first.value().version() != 0);
   f.put("a", "two");
-  auto second = f.cache->find(f.pool, "a");
+  nivo::Result<nivo::ReadHandle> second = f.cache->find(f.pool, "a");
   CHECK(text(first.value()) == "one");
   CHECK(text(second.value()) == "two");
   CHECK(first.value().version() != second.value().version());
@@ -97,16 +99,16 @@ void publish_and_snapshot() {
 }
 void write_conditions_and_retry() {
   Fixture f;
-  auto original = f.cache->put(f.pool, "a", bytes("one"));
-  const auto version = original.value().version();
-  auto draft = f.cache->allocate(f.pool, "a", 0);
+  nivo::Result<nivo::ReadHandle> original = f.cache->put(f.pool, "a", bytes("one"));
+  const nivo::Version version = original.value().version();
+  nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, "a", 0);
   CHECK(f.cache->publish(std::move(draft).value(), {.mode = nivo::WriteMode::insert_only}).status()
         == Status::already_exists);
   CHECK(draft.value());
   CHECK(f.cache->publish(std::move(draft).value(),
         {.mode = nivo::WriteMode::compare_exchange, .expected_version = version + 1}).status()
         == Status::version_mismatch);
-  auto replaced = f.cache->publish(std::move(draft).value(),
+  nivo::Result<nivo::ReadHandle> replaced = f.cache->publish(std::move(draft).value(),
       {.mode = nivo::WriteMode::compare_exchange, .expected_version = version});
   CHECK(replaced && !draft.value());
   CHECK(f.cache->erase(f.pool, "a", version) == Status::version_mismatch);
@@ -122,9 +124,10 @@ void write_conditions_and_retry() {
 }
 void ttl_boundary_and_publish_time() {
   Fixture f;
-  auto draft = f.cache->allocate(f.pool, "a", 1);
+  nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, "a", 1);
   f.clock->advance(100ms);
-  auto snapshot = f.cache->publish(std::move(draft).value(), {.ttl = 10ms});
+  nivo::Result<nivo::ReadHandle> snapshot =
+      f.cache->publish(std::move(draft).value(), {.ttl = 10ms});
   f.clock->advance(9ms);
   CHECK(f.cache->find(f.pool, "a"));
   f.clock->advance(1ms);
@@ -163,13 +166,13 @@ void lru_and_peek() {
   f.put("d", "d");
   CHECK(f.cache->peek(f.pool, "b").status() == Status::not_found);
   CHECK(f.cache->peek(f.pool, "a"));
-  auto stats = f.cache->stats();
+  nivo::CacheStats stats = f.cache->stats();
   CHECK(stats.counters.hits == 1 && stats.counters.misses == 0);
   CHECK(stats.counters.evictions == 1);
 }
 void fifo_policy() {
   Fixture f(6);
-  auto pool = f.cache->add_pool({"fifo", 6, nivo::EvictionPolicy::fifo}).value();
+  nivo::PoolId pool = f.cache->add_pool({"fifo", 6, nivo::EvictionPolicy::fifo}).value();
   CHECK(f.cache->put(pool, "a", bytes("a")));
   CHECK(f.cache->put(pool, "b", bytes("b")));
   CHECK(f.cache->put(pool, "c", bytes("c")));
@@ -179,13 +182,13 @@ void fifo_policy() {
 }
 void pins_and_capacity() {
   Fixture f(4);
-  auto pinned = f.cache->put(f.pool, "a", bytes("123"));
+  nivo::Result<nivo::ReadHandle> pinned = f.cache->put(f.pool, "a", bytes("123"));
   CHECK(pinned);
   CHECK(f.cache->allocate(f.pool, "b", 0).status() == Status::resource_exhausted);
   CHECK(f.cache->erase(f.pool, "a") == Status::ok);
   CHECK(f.cache->allocate(f.pool, "b", 0).status() == Status::resource_exhausted);
   pinned.value().reset();
-  auto draft = f.cache->allocate(f.pool, "b", 3);
+  nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, "b", 3);
   CHECK(draft);
   CHECK(f.cache->allocate(f.pool, "c", 0).status() == Status::resource_exhausted);
   CHECK(f.cache->clear(f.pool) == Status::ok);
@@ -202,7 +205,7 @@ void update_protects_old_key() {
 }
 void eviction_skips_pins() {
   Fixture f(6);
-  auto pinned = f.cache->put(f.pool, "a", bytes("a"));
+  nivo::Result<nivo::ReadHandle> pinned = f.cache->put(f.pool, "a", bytes("a"));
   f.put("b", "b"); f.put("c", "c");
   f.put("d", "d");
   CHECK(f.cache->peek(f.pool, "a"));
@@ -211,13 +214,13 @@ void eviction_skips_pins() {
 }
 void pool_isolation_resize() {
   Fixture f(8);
-  auto other = f.cache->add_pool({"other", 8}).value();
+  nivo::PoolId other = f.cache->add_pool({"other", 8}).value();
   f.put("a", "one");
   CHECK(f.cache->put(other, "a", bytes("two")));
   CHECK(text(f.cache->find(f.pool, "a").value()) == "one");
   CHECK(text(f.cache->find(other, "a").value()) == "two");
   CHECK(f.cache->resize_pool(f.pool, 9) == Status::resource_exhausted);
-  auto pin = f.cache->find(f.pool, "a");
+  nivo::Result<nivo::ReadHandle> pin = f.cache->find(f.pool, "a");
   CHECK(f.cache->resize_pool(f.pool, 2) == Status::resource_exhausted);
   CHECK(f.cache->pool_stats(f.pool).value().capacity_bytes == 8);
   pin.value().reset();
@@ -229,7 +232,7 @@ void pool_isolation_resize() {
 }
 void foreign_and_empty_handles() {
   Fixture a, b;
-  auto draft = a.cache->allocate(a.pool, "k", 1);
+  nivo::Result<nivo::WriteHandle> draft = a.cache->allocate(a.pool, "k", 1);
   CHECK(b.cache->publish(std::move(draft).value()).status() == Status::invalid_argument);
   CHECK(draft.value());
   CHECK(a.cache->publish(std::move(draft).value()));
@@ -257,8 +260,8 @@ void binary_keys_and_validation() {
 }
 void close_and_lifetime() {
   Fixture f;
-  auto read = f.cache->put(f.pool, "a", bytes("alive"));
-  auto draft = f.cache->allocate(f.pool, "b", 2);
+  nivo::Result<nivo::ReadHandle> read = f.cache->put(f.pool, "a", bytes("alive"));
+  nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, "b", 2);
   f.cache->close(); f.cache->close();
   CHECK(f.cache->stats().closed && f.cache->stats().indexed_items == 0);
   CHECK(f.cache->stats().allocated_bytes == 9);
@@ -302,21 +305,21 @@ void result_contract() {
 }
 void concurrent_cas() {
   Fixture f;
-  auto initial = f.cache->put(f.pool, "a", bytes("zero"));
-  const auto version = initial.value().version();
+  nivo::Result<nivo::ReadHandle> initial = f.cache->put(f.pool, "a", bytes("zero"));
+  const nivo::Version version = initial.value().version();
   std::barrier gate(8);
   std::atomic<int> winners{0}, conflicts{0};
   std::vector<std::thread> threads;
   for (int i = 0; i < 8; ++i) {
     threads.emplace_back([&, i] {
       gate.arrive_and_wait();
-      auto result = f.cache->put(f.pool, "a", bytes(std::to_string(i)),
+      nivo::Result<nivo::ReadHandle> result = f.cache->put(f.pool, "a", bytes(std::to_string(i)),
           {.mode = nivo::WriteMode::compare_exchange, .expected_version = version});
       if (result) ++winners;
       else if (result.status() == Status::version_mismatch) ++conflicts;
     });
   }
-  for (auto& thread : threads) thread.join();
+  for (std::thread& thread : threads) thread.join();
   CHECK(winners == 1 && conflicts == 7);
   CHECK(text(initial.value()) == "zero");
 }
@@ -327,12 +330,12 @@ void concurrent_operations() {
   for (int i = 0; i < 6; ++i) {
     threads.emplace_back([&, i] {
       try {
-        const auto key = std::to_string(i);
+        const std::string key = std::to_string(i);
         for (int j = 0; j < 500; ++j) {
-          const auto value = std::to_string(j);
-          auto put = f.cache->put(f.pool, key, bytes(value));
+          const std::string value = std::to_string(j);
+          nivo::Result<nivo::ReadHandle> put = f.cache->put(f.pool, key, bytes(value));
           CHECK(put);
-          auto found = f.cache->find(f.pool, key);
+          nivo::Result<nivo::ReadHandle> found = f.cache->find(f.pool, key);
           CHECK(found && text(found.value()) == value);
           CHECK(f.cache->erase(f.pool, key, found.value().version()) == Status::ok);
           CHECK(text(put.value()) == value);
@@ -340,14 +343,14 @@ void concurrent_operations() {
       } catch (...) { failed = true; }
     });
   }
-  for (auto& thread : threads) thread.join();
+  for (std::thread& thread : threads) thread.join();
   CHECK(!failed);
   CHECK(f.cache->stats().indexed_items == 0 && f.cache->stats().allocated_bytes == 0);
   CHECK(f.cache->stats().counters.inserts == 3000);
 }
 void concurrent_close() {
   Fixture f;
-  auto pinned = f.cache->put(f.pool, "a", bytes("stable"));
+  nivo::Result<nivo::ReadHandle> pinned = f.cache->put(f.pool, "a", bytes("stable"));
   std::barrier gate(4);
   std::atomic<bool> failed{false};
   std::vector<std::thread> readers;
@@ -355,14 +358,14 @@ void concurrent_close() {
     readers.emplace_back([&] {
       gate.arrive_and_wait();
       for (int j = 0; j < 500; ++j) {
-        auto result = f.cache->find(f.pool, "a");
+        nivo::Result<nivo::ReadHandle> result = f.cache->find(f.pool, "a");
         if (result ? text(result.value()) != "stable" : result.status() != Status::closed) failed = true;
       }
     });
   }
   gate.arrive_and_wait();
   f.cache->close();
-  for (auto& reader : readers) reader.join();
+  for (std::thread& reader : readers) reader.join();
   CHECK(!failed && text(pinned.value()) == "stable");
 }
 }  // namespace
@@ -381,7 +384,9 @@ int main() {
     {"concurrent_operations", concurrent_operations}, {"concurrent_close", concurrent_close}
   };
   unsigned failures = 0;
-  for (const auto& [name, test] : cases) {
+  for (const std::pair<const char*, std::function<void()>>& test_case : cases) {
+    const char* name = test_case.first;
+    const std::function<void()>& test = test_case.second;
     try { test(); std::cout << "PASS " << name << '\n'; }
     catch (const std::exception& e) { ++failures; std::cerr << "FAIL " << name << ": " << e.what() << '\n'; }
   }

@@ -12,25 +12,28 @@ int main(int argc, char** argv) {
   if (argc > 2) return 1;
   if (argc == 2) {
     const std::string_view arg(argv[1]);
-    const auto result = std::from_chars(arg.data(), arg.data() + arg.size(), iterations);
+    const std::from_chars_result result =
+        std::from_chars(arg.data(), arg.data() + arg.size(), iterations);
     if (result.ec != std::errc{} || result.ptr != arg.data() + arg.size() || iterations == 0) return 1;
   }
-  auto created = nivo::Cache::create();
+  nivo::Result<std::unique_ptr<nivo::Cache>> created = nivo::Cache::create();
   if (!created) return 1;
-  auto cache = std::move(created).value();
-  auto pool = cache->add_pool({"bench", 32 * 1024 * 1024});
+  std::unique_ptr<nivo::Cache> cache = std::move(created).value();
+  nivo::Result<nivo::PoolId> pool = cache->add_pool({"bench", 32 * 1024 * 1024});
   if (!pool) return 1;
   std::vector<std::string> keys;
   const std::string payload(128, 'x');
   for (unsigned i = 0; i < 10000; ++i) {
     keys.push_back(std::to_string(i));
-    auto result = cache->put(pool.value(), keys.back(), std::as_bytes(std::span(payload.data(), payload.size())));
+    nivo::Result<nivo::ReadHandle> result =
+        cache->put(pool.value(), keys.back(),
+                   std::as_bytes(std::span(payload.data(), payload.size())));
     if (!result) return 1;
   }
   std::size_t checksum = 0;
-  auto start = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   for (std::size_t i = 0; i < iterations; ++i) {
-    auto result = cache->find(pool.value(), keys[i % keys.size()]);
+    nivo::Result<nivo::ReadHandle> result = cache->find(pool.value(), keys[i % keys.size()]);
     if (!result) return 1;
     checksum += result.value().bytes().size();
   }
