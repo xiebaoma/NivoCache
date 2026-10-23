@@ -9,7 +9,28 @@
 #include "nivo/config.h"
 
 namespace nivo {
-namespace detail { struct Entry; }
+namespace detail {
+struct Entry;
+// Intrusive ownership keeps the reference count in the allocator-owned entry.
+class EntryPtr {
+ public:
+  EntryPtr() noexcept = default;
+  explicit EntryPtr(Entry* entry) noexcept : entry_(entry) {}
+  EntryPtr(const EntryPtr& other) noexcept;
+  EntryPtr(EntryPtr&& other) noexcept : entry_(std::exchange(other.entry_, nullptr)) {}
+  EntryPtr& operator=(const EntryPtr& other) noexcept;
+  EntryPtr& operator=(EntryPtr&& other) noexcept;
+  ~EntryPtr();
+  [[nodiscard]] explicit operator bool() const noexcept { return entry_ != nullptr; }
+  [[nodiscard]] Entry* operator->() const noexcept { return entry_; }
+  [[nodiscard]] Entry& operator*() const noexcept { return *entry_; }
+  [[nodiscard]] std::size_t use_count() const noexcept;
+  void reset() noexcept;
+
+ private:
+  Entry* entry_ = nullptr;
+};
+}
 class Cache;
 
 // Copyable immutable snapshot. Pins memory, including after erase/replace/close
@@ -27,8 +48,8 @@ class ReadHandle {
 
  private:
   friend class Cache;
-  explicit ReadHandle(std::shared_ptr<const detail::Entry> entry) : entry_(std::move(entry)) {}
-  std::shared_ptr<const detail::Entry> entry_;
+  explicit ReadHandle(detail::EntryPtr entry) : entry_(std::move(entry)) {}
+  detail::EntryPtr entry_;
 };
 
 // Move-only, unpublished allocation. Do not share one mutable handle across
@@ -49,7 +70,7 @@ class WriteHandle {
 
  private:
   friend class Cache;
-  explicit WriteHandle(std::shared_ptr<detail::Entry> entry) : entry_(std::move(entry)) {}
-  std::shared_ptr<detail::Entry> entry_;
+  explicit WriteHandle(detail::EntryPtr entry) : entry_(std::move(entry)) {}
+  detail::EntryPtr entry_;
 };
 }  // namespace nivo

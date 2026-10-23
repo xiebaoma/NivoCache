@@ -30,6 +30,13 @@ class Cache final {
   [[nodiscard]] Result<std::vector<PoolStats>> pools() const;
   [[nodiscard]] Result<PoolStats> pool_stats(PoolId pool) const;
   [[nodiscard]] CacheStats stats() const;
+  // On-demand memory monitoring, including after close(). Does not prune TTLs,
+  // trim regions or change eviction order. O(number of pools), not items.
+  // Each pool's storage breakdown is consistent under concurrent handle release;
+  // pools are sampled sequentially. Only the global overload samples process RSS
+  // (macOS/Linux; unavailable on other platforms or if the OS query fails).
+  [[nodiscard]] CacheMemoryStats memory_stats() const;
+  [[nodiscard]] Result<MemoryStats> memory_stats(PoolId pool) const;
 
   // Zero-initialized raw bytes; charges key.size()+value_size. May evict other
   // keys, but never this key (so an update can fail without losing its old value).
@@ -49,8 +56,20 @@ class Cache final {
   [[nodiscard]] Status clear(PoolId pool);
   // Explicit expiry maintenance; no background threads in the reference engine.
   [[nodiscard]] Result<std::size_t> prune_expired(PoolId pool);
+  // Synchronously compact one pool or all pools under the cache lock. Prunes
+  // entries expired at the start of the call; preserves versions, TTL and
+  // eviction order. Pins, unpublished drafts and direct large allocations are
+  // not moved. Regions containing pinned entries or drafts are skipped entirely.
+  // Moves require estimated savings of at least one slab and 1% of candidate
+  // region storage; wholly idle regions are released even without moving items.
+  // Uses temporary storage for planning and copies; never evicts live entries
+  // or charges copies against the logical quota. Allocation failure returns
+  // resource_exhausted; completed moves and expiry cleanup remain valid.
+  // Reports allocator-owned bytes, not RSS. No background compaction runs.
+  [[nodiscard]] Result<CompactionStats> compact(PoolId pool);
+  [[nodiscard]] Result<CompactionStats> compact();
   // Idempotent; unlinks everything, rejects future data/control operations.
-  // stats(), pool_stats(), pools(), and existing handles remain usable.
+  // Statistics APIs and existing handles remain usable.
   void close();
 
  private:

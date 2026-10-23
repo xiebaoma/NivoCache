@@ -1,7 +1,10 @@
 #include "nivo/cache.h"
+#include "memory_allocator.h"
+#include "process_memory.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <list>
 #include <map>
@@ -12,18 +15,46 @@
 namespace nivo {
 namespace detail {
 struct Owner {};
-struct Budget { std::atomic<std::size_t> used{0}; };
 struct Entry {
+  std::atomic<std::size_t> references{1};
   std::shared_ptr<const Owner> owner;
-  std::shared_ptr<Budget> budget;
-  std::string key;
-  std::vector<std::byte> value;
+  std::shared_ptr<MemoryAllocator> budget;
+  MemoryAllocator::Allocation allocation;
+  std::string_view key;
+  std::span<std::byte> value;
   PoolId pool = invalid_pool;
   Version version = invalid_version;
   std::size_t charge = 0;
   std::optional<Duration> expires_at;
-  ~Entry() { if (budget) budget->used.fetch_sub(charge, std::memory_order_relaxed); }
 };
+EntryPtr::EntryPtr(const EntryPtr& other) noexcept : entry_(other.entry_) {
+  if (entry_) entry_->references.fetch_add(1, std::memory_order_relaxed);
+}
+EntryPtr& EntryPtr::operator=(const EntryPtr& other) noexcept {
+  EntryPtr copy(other);
+  std::swap(entry_, copy.entry_);
+  return *this;
+}
+EntryPtr& EntryPtr::operator=(EntryPtr&& other) noexcept {
+  EntryPtr moved(std::move(other));
+  std::swap(entry_, moved.entry_);
+  return *this;
+}
+EntryPtr::~EntryPtr() { reset(); }
+std::size_t EntryPtr::use_count() const noexcept {
+  return entry_ ? entry_->references.load(std::memory_order_acquire) : 0;
+}
+void EntryPtr::reset() noexcept {
+  Entry* entry = std::exchange(entry_, nullptr);
+  if (!entry || entry->references.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+  // Keep storage alive through destruction of the entry's own allocator owner.
+  std::shared_ptr<MemoryAllocator> allocator = std::move(entry->budget);
+  const MemoryAllocator::Allocation allocation = entry->allocation;
+  const std::size_t charge = entry->charge;
+  entry->~Entry();
+  allocator->deallocate(allocation);
+  allocator->used.fetch_sub(charge, std::memory_order_relaxed);
+}
 }  // namespace detail
 
 std::span<const std::byte> ReadHandle::bytes() const noexcept {
@@ -65,20 +96,51 @@ void accumulate(Counters& a, const Counters& b) {
   a.inserts += b.inserts; a.replacements += b.replacements;
   a.erases += b.erases; a.evictions += b.evictions; a.expirations += b.expirations;
 }
+void accumulate(AllocatorStats& a, const AllocatorStats& b) {
+  a.requested_bytes += b.requested_bytes;
+  a.active_bytes += b.active_bytes;
+  a.reserved_bytes += b.reserved_bytes;
+  a.live_allocations += b.live_allocations;
+  a.slabs += b.slabs;
+  a.large_allocations += b.large_allocations;
+  a.system_allocations += b.system_allocations;
+  a.reused_allocations += b.reused_allocations;
+  a.regions += b.regions;
+  a.empty_slabs += b.empty_slabs;
+  a.reserve_limit_bytes += b.reserve_limit_bytes;
+  a.refill_batch_size = std::max(a.refill_batch_size, b.refill_batch_size);
+  a.batch_refills += b.batch_refills;
+  a.batch_fallbacks += b.batch_fallbacks;
+  a.metadata_bytes += b.metadata_bytes;
+  a.reclaimable_bytes += b.reclaimable_bytes;
+}
+void accumulate(MemoryStats& a, const MemoryStats& b) {
+  a.reserved_bytes += b.reserved_bytes;
+  a.kv_bytes += b.kv_bytes;
+  a.indexed_kv_bytes += b.indexed_kv_bytes;
+  a.retained_kv_bytes += b.retained_kv_bytes;
+  a.entry_metadata_bytes += b.entry_metadata_bytes;
+  a.allocator_metadata_bytes += b.allocator_metadata_bytes;
+  a.internal_fragmentation_bytes += b.internal_fragmentation_bytes;
+  a.unused_bytes += b.unused_bytes;
+  a.reclaimable_bytes += b.reclaimable_bytes;
+}
 }  // namespace
 
 struct Cache::Impl {
-  using Queue = std::list<std::shared_ptr<detail::Entry>>;
+  using Queue = std::list<detail::EntryPtr>;
   using Index = std::map<std::string, Queue::iterator, std::less<>>;
   struct Pool {
     PoolId id;
     PoolConfig config;
-    std::shared_ptr<detail::Budget> budget = std::make_shared<detail::Budget>();
+    std::shared_ptr<detail::MemoryAllocator> budget;
     Queue queue;  // front = most recent
     Index index;
     std::size_t indexed_bytes = 0;
     Counters counters;
-    Pool(PoolId id_, PoolConfig config_) : id(id_), config(std::move(config_)) {}
+    Pool(PoolId id_, PoolConfig config_)
+        : id(id_), config(std::move(config_)),
+          budget(std::make_shared<detail::MemoryAllocator>(config.capacity_bytes)) {}
   };
   using PoolMap = std::map<PoolId, Pool>;
   explicit Impl(CacheConfig config_) : config(std::move(config_)) {
@@ -101,7 +163,7 @@ struct Cache::Impl {
   }
   static void unlink(Pool& p, Queue::iterator it) {
     p.indexed_bytes -= (*it)->charge;
-    p.index.erase((*it)->key);
+    p.index.erase(p.index.find((*it)->key));
     p.queue.erase(it);
   }
   static std::size_t prune(Pool& p, Duration now) {
@@ -112,6 +174,55 @@ struct Cache::Impl {
     }
     p.counters.expirations += count;
     return count;
+  }
+  static CompactionStats compact_pool(Pool& p, Duration now) {
+    CompactionStats result;
+    result.pools = 1;
+    result.reserved_bytes_before = p.budget->stats().reserved_bytes;
+    result.expired_items = prune(p, now);
+    try {
+      std::vector<Queue::iterator> entries;
+      std::vector<detail::MemoryAllocator::Allocation> allocations;
+      entries.reserve(p.index.size());
+      allocations.reserve(p.index.size());
+      for (Queue::iterator it = p.queue.begin(); it != p.queue.end(); ++it) {
+        if (it->use_count() == 1 && (*it)->allocation.slab) {
+          entries.push_back(it);
+          allocations.push_back((*it)->allocation);
+        }
+      }
+      detail::MemoryAllocator::Compaction compaction(*p.budget, allocations);
+      for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (!compaction.should_move(allocations[i])) continue;
+        detail::Entry& source = **entries[i];
+        const detail::MemoryAllocator::Allocation allocation = compaction.allocate(allocations[i]);
+        detail::Entry* destination = new (allocation.data) detail::Entry{};
+        destination->owner = source.owner;
+        destination->budget = source.budget;
+        destination->allocation = allocation;
+        destination->pool = source.pool;
+        destination->version = source.version;
+        destination->expires_at = source.expires_at;
+        char* key = reinterpret_cast<char*>(destination + 1);
+        std::byte* value = reinterpret_cast<std::byte*>(key + source.key.size());
+        std::memcpy(key, source.key.data(), source.key.size());
+        if (!source.value.empty()) std::memcpy(value, source.value.data(), source.value.size());
+        destination->key = {key, source.key.size()};
+        destination->value = {value, source.value.size()};
+        // Everything after storage allocation is non-throwing. Transfer the
+        // existing charge and queue position without a second logical charge.
+        // With the cache lock held, a sole queue reference cannot gain a pin.
+        destination->charge = std::exchange(source.charge, 0);
+        *entries[i] = detail::EntryPtr(destination);
+        ++result.moved_items;
+      }
+    } catch (const std::bad_alloc&) {
+      p.budget->trim();
+      throw;
+    }
+    result.skipped_items = p.index.size() - result.moved_items;
+    result.reserved_bytes_after = p.budget->stats().reserved_bytes;
+    return result;
   }
   static void expire_key(Pool& p, std::string_view key, Duration now) {
     Index::iterator it = p.index.find(key);
@@ -136,12 +247,29 @@ struct Cache::Impl {
   static PoolStats snapshot(const Pool& p) {
     return {p.id, p.config.name, p.config.capacity_bytes,
             p.budget->used.load(std::memory_order_relaxed), p.indexed_bytes,
-            p.index.size(), p.counters};
+            p.index.size(), p.counters, p.budget->stats()};
+  }
+  static MemoryStats memory_snapshot(const Pool& p) {
+    // requested_bytes and live_allocations come from one locked allocator
+    // snapshot. Reading the independently updated quota would race with the
+    // gap between storage release and quota release on a handle's last reset.
+    const AllocatorStats storage = p.budget->inspect();
+    MemoryStats result;
+    result.reserved_bytes = storage.reserved_bytes;
+    result.entry_metadata_bytes = storage.live_allocations * sizeof(detail::Entry);
+    result.kv_bytes = storage.requested_bytes - result.entry_metadata_bytes;
+    result.indexed_kv_bytes = p.indexed_bytes;
+    result.retained_kv_bytes = result.kv_bytes - result.indexed_kv_bytes;
+    result.allocator_metadata_bytes = storage.metadata_bytes;
+    result.internal_fragmentation_bytes = storage.active_bytes - storage.requested_bytes;
+    result.unused_bytes = storage.reserved_bytes - storage.metadata_bytes - storage.active_bytes;
+    result.reclaimable_bytes = storage.reclaimable_bytes;
+    return result;
   }
 };
 
 Cache::Cache(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
-Cache::~Cache() = default;
+Cache::~Cache() { close(); }
 Result<std::unique_ptr<Cache>> Cache::create(CacheConfig config) {
   if (config.capacity_bytes == 0 || config.max_key_bytes == 0 || config.max_value_bytes == 0)
     return Status::invalid_argument;
@@ -180,6 +308,7 @@ Status Cache::resize_pool(PoolId pool, std::size_t capacity_bytes) {
   Impl::prune(p, impl_->config.clock->now());
   if (!Impl::make_room(p, capacity_bytes, {})) return Status::resource_exhausted;
   p.config.capacity_bytes = capacity_bytes;
+  p.budget->resize(capacity_bytes);
   impl_->assigned = other + capacity_bytes;
   return Status::ok;
 }
@@ -211,8 +340,30 @@ CacheStats Cache::stats() const {
     result.indexed_bytes += p.indexed_bytes;
     result.indexed_items += p.index.size();
     accumulate(result.counters, p.counters);
+    accumulate(result.allocator, p.budget->stats());
   }
   return result;
+}
+CacheMemoryStats Cache::memory_stats() const {
+  CacheMemoryStats result;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    result.pools.reserve(impl_->pools.size());
+    for (const Impl::PoolMap::value_type& pool_entry : impl_->pools) {
+      const Impl::Pool& pool = pool_entry.second;
+      const MemoryStats memory = Impl::memory_snapshot(pool);
+      result.pools.push_back({pool.id, pool.config.name, memory});
+      accumulate(result.total, memory);
+    }
+  }
+  result.process_rss_bytes = detail::process_rss_bytes();
+  return result;
+}
+Result<MemoryStats> Cache::memory_stats(PoolId pool) const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  Impl::PoolMap::const_iterator it = impl_->pools.find(pool);
+  if (it == impl_->pools.end()) return Status::pool_not_found;
+  return Impl::memory_snapshot(it->second);
 }
 Result<WriteHandle> Cache::allocate(PoolId pool, std::string_view key, std::size_t value_size) {
   std::lock_guard lock(impl_->mutex);
@@ -223,6 +374,8 @@ Result<WriteHandle> Cache::allocate(PoolId pool, std::string_view key, std::size
   if (it == impl_->pools.end()) return Status::pool_not_found;
   Impl::Pool& p = it->second;
   const std::size_t charge = key.size() + value_size;
+  if (charge > std::numeric_limits<std::size_t>::max() - sizeof(detail::Entry))
+    return Status::invalid_argument;
   if (charge > p.config.capacity_bytes) {
     ++p.counters.allocation_failures;
     return Status::resource_exhausted;
@@ -235,11 +388,23 @@ Result<WriteHandle> Cache::allocate(PoolId pool, std::string_view key, std::size
       return Status::resource_exhausted;
     }
   }
-  std::shared_ptr<detail::Entry> entry = std::make_shared<detail::Entry>();
+  detail::MemoryAllocator::Allocation allocation;
+  try {
+    allocation = p.budget->allocate(sizeof(detail::Entry) + charge);
+  } catch (const std::bad_alloc&) {
+    ++p.counters.allocation_failures;
+    return Status::resource_exhausted;
+  }
+  detail::EntryPtr entry(new (allocation.data) detail::Entry{});
   entry->owner = impl_->owner;
   entry->budget = p.budget;
-  entry->key = key;
-  entry->value.resize(value_size);
+  entry->allocation = allocation;
+  char* key_data = reinterpret_cast<char*>(allocation.data) + sizeof(detail::Entry);
+  std::memcpy(key_data, key.data(), key.size());
+  entry->key = std::string_view(key_data, key.size());
+  std::byte* value_data = reinterpret_cast<std::byte*>(key_data + key.size());
+  entry->value = std::span<std::byte>(value_data, value_size);
+  std::fill(entry->value.begin(), entry->value.end(), std::byte{0});
   entry->pool = pool;
   entry->charge = charge;
   p.budget->used.fetch_add(charge, std::memory_order_relaxed);
@@ -339,6 +504,7 @@ Status Cache::clear(PoolId pool) {
   Impl::Pool& p = it->second;
   p.counters.erases += p.index.size();
   p.index.clear(); p.queue.clear(); p.indexed_bytes = 0;
+  p.budget->trim();
   return Status::ok;
 }
 Result<std::size_t> Cache::prune_expired(PoolId pool) {
@@ -348,11 +514,43 @@ Result<std::size_t> Cache::prune_expired(PoolId pool) {
   if (it == impl_->pools.end()) return Status::pool_not_found;
   return Impl::prune(it->second, impl_->config.clock->now());
 }
+Result<CompactionStats> Cache::compact(PoolId pool) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::closed;
+  Impl::PoolMap::iterator it = impl_->pools.find(pool);
+  if (it == impl_->pools.end()) return Status::pool_not_found;
+  try {
+    return Impl::compact_pool(it->second, impl_->config.clock->now());
+  } catch (const std::bad_alloc&) {
+    return Status::resource_exhausted;
+  }
+}
+Result<CompactionStats> Cache::compact() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->closed) return Status::closed;
+  const Duration now = impl_->config.clock->now();
+  CompactionStats result;
+  try {
+    for (Impl::PoolMap::value_type& pool_entry : impl_->pools) {
+      const CompactionStats pool = Impl::compact_pool(pool_entry.second, now);
+      result.pools += pool.pools;
+      result.moved_items += pool.moved_items;
+      result.skipped_items += pool.skipped_items;
+      result.expired_items += pool.expired_items;
+      result.reserved_bytes_before += pool.reserved_bytes_before;
+      result.reserved_bytes_after += pool.reserved_bytes_after;
+    }
+    return result;
+  } catch (const std::bad_alloc&) {
+    return Status::resource_exhausted;
+  }
+}
 void Cache::close() {
   std::lock_guard lock(impl_->mutex);
   impl_->closed = true;
   for (Impl::PoolMap::value_type& pool_entry : impl_->pools) {
     Impl::Pool& p = pool_entry.second;
+    p.budget->trim(true);
     p.index.clear(); p.queue.clear(); p.indexed_bytes = 0;
   }
 }
