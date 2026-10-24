@@ -1,12 +1,16 @@
 #include <nivo/nivo.h>
 #include "../src/memory_allocator.h"
 #include "../src/process_memory.h"
+#include "../src/cache_index.h"
+#include "../src/eviction_policy.h"
 
 #include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <cerrno>
 #include <functional>
+#include <future>
+#include <condition_variable>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -1923,10 +1927,419 @@ void allocator_compaction_skips_marginal_savings() {
   allocator.trim();
   CHECK(probe.live.empty() && !probe.invalid_delete);
 }
+
+
+void index_collision_chain_and_ownership() {
+  std::array<nivo::detail::Entry, 5> entries;
+  nivo::detail::CacheIndex index(8192);
+  std::vector<std::string> keys;
+  for (std::size_t i = 0; keys.size() < 3; ++i) {
+    const std::string key = "collision-" + std::to_string(i);
+    if (index.bucket_for(key) == 0) keys.push_back(key);
+  }
+  for (std::size_t i = 0; i < 3; ++i) {
+    entries[i].key = keys[i];
+    entries[i].charge = i + 1;
+    index.write(keys[i], [&](nivo::detail::CacheIndex::Slot& slot) {
+      CHECK(!slot.get());
+      CHECK(!slot.replace(entries[i]));
+    });
+  }
+  CHECK(index.stats().items == 3 && index.stats().bytes == 6);
+  nivo::detail::EntryPtr pinned = index.find(keys[1]);
+  CHECK(&*pinned == &entries[1] && pinned.use_count() == 3);
+  entries[3].key = keys[1];
+  entries[3].charge = 9;
+  index.write(keys[1], [&](nivo::detail::CacheIndex::Slot& slot) {
+    nivo::detail::EntryPtr old = slot.replace(entries[3]);
+    CHECK(&*old == &entries[1]);
+  });
+  CHECK(&*index.find(keys[1]) == &entries[3]);
+  CHECK(&*pinned == &entries[1] && pinned.use_count() == 2);
+  CHECK(index.stats().items == 3 && index.stats().bytes == 13);
+  // Expiry followed by insertion in one transaction must not mistake the next
+  // collision-chain node for the removed key or accidentally replace that node.
+  entries[4].key = keys[0];
+  entries[4].charge = 7;
+  index.write(keys[0], [&](nivo::detail::CacheIndex::Slot& slot) {
+    nivo::detail::EntryPtr old = slot.remove();
+    CHECK(&*old == &entries[0] && !slot.get());
+    CHECK(!slot.replace(entries[4]));
+  });
+  CHECK(&*index.find(keys[0]) == &entries[4]);
+  CHECK(&*index.find(keys[1]) == &entries[3]);
+  CHECK(&*index.find(keys[2]) == &entries[2]);
+  CHECK(index.stats().items == 3 && index.stats().bytes == 19);
+  for (const std::string& key : keys) {
+    index.write(key, [](nivo::detail::CacheIndex::Slot& slot) { CHECK(slot.remove()); });
+    CHECK(!index.find(key));
+  }
+  CHECK(index.stats().items == 0 && index.stats().bytes == 0);
+  pinned.reset();
+  for (const nivo::detail::Entry& entry : entries) CHECK(entry.references.load() == 1);
+}
+
+void index_stripe_parallelism() {
+  nivo::detail::CacheIndex index(8192);
+  const std::string first = "first";
+  std::string other;
+  std::string conflict;
+  for (std::size_t i = 0; other.empty() || conflict.empty(); ++i) {
+    const std::string key = "stripe-" + std::to_string(i);
+    if (index.bucket_for(key) % index.stripe_count == index.bucket_for(first) % index.stripe_count)
+      conflict = key;
+    else other = key;
+  }
+  std::promise<void> entered;
+  std::future<void> held = entered.get_future();
+  std::promise<void> release;
+  std::shared_future<void> released = release.get_future().share();
+  std::thread holder([&] {
+    index.write(first, [&](nivo::detail::CacheIndex::Slot&) {
+      entered.set_value();
+      released.wait();
+    });
+  });
+  held.wait();
+  std::future<void> independent = std::async(std::launch::async, [&] {
+    index.write(other, [](nivo::detail::CacheIndex::Slot&) {});
+  });
+  std::future<void> blocked = std::async(std::launch::async, [&] {
+    index.write(conflict, [](nivo::detail::CacheIndex::Slot&) {});
+  });
+  std::future<void> reader = std::async(std::launch::async, [&] { (void)index.find(first); });
+  const bool parallel = independent.wait_for(2s) == std::future_status::ready;
+  const bool writer_blocked = blocked.wait_for(20ms) == std::future_status::timeout;
+  const bool reader_blocked = reader.wait_for(20ms) == std::future_status::timeout;
+  release.set_value();
+  holder.join();
+  independent.get();
+  blocked.get();
+  reader.get();
+  CHECK(parallel && writer_blocked && reader_blocked);
+}
+
+void concurrent_quota_reservations() {
+  Fixture f(1024);
+  std::array<nivo::WriteHandle, 16> drafts;
+  std::array<std::size_t, 16> charges{};
+  std::barrier gate(16);
+  std::atomic<std::size_t> successes{0}, exhausted{0}, errors{0};
+  std::vector<std::thread> workers;
+  for (std::size_t i = 0; i < drafts.size(); ++i) {
+    workers.emplace_back([&, i] {
+      const std::string key = "draft-" + std::to_string(i);
+      gate.arrive_and_wait();
+      nivo::Result<nivo::WriteHandle> allocated = f.cache->allocate(f.pool, key, 128 - key.size());
+      if (allocated) {
+        charges[i] = allocated.value().charge();
+        drafts[i] = std::move(allocated).value();
+        ++successes;
+      } else if (allocated.status() == Status::resource_exhausted) ++exhausted;
+      else ++errors;
+    });
+  }
+  for (std::thread& worker : workers) worker.join();
+  CHECK(successes == 8 && exhausted == 8 && errors == 0);
+  std::size_t total = 0;
+  for (std::size_t charge : charges) total += charge;
+  CHECK(total == 1024 && f.cache->stats().allocated_bytes == total);
+  for (nivo::WriteHandle& draft : drafts) draft.reset();
+  CHECK(f.cache->stats().allocated_bytes == 0);
+}
+
+void concurrent_insert_only_and_erase() {
+  Fixture f(1024 * 1024);
+  std::barrier gate(12);
+  std::atomic<std::size_t> inserted{0}, duplicates{0}, erased{0}, missing{0}, errors{0};
+  std::vector<std::thread> writers;
+  for (std::size_t i = 0; i < 12; ++i) {
+    writers.emplace_back([&] {
+      gate.arrive_and_wait();
+      nivo::Result<nivo::ReadHandle> result = f.cache->put(f.pool, "same", bytes("value"),
+          {.mode = nivo::WriteMode::insert_only});
+      if (result) ++inserted;
+      else if (result.status() == Status::already_exists) ++duplicates;
+      else ++errors;
+    });
+  }
+  for (std::thread& writer : writers) writer.join();
+  CHECK(inserted == 1 && duplicates == 11 && errors == 0);
+  nivo::ReadHandle pin = std::move(f.cache->peek(f.pool, "same")).value();
+  writers.clear();
+  for (std::size_t i = 0; i < 12; ++i) {
+    writers.emplace_back([&] {
+      gate.arrive_and_wait();
+      const Status status = f.cache->erase(f.pool, "same", pin.version());
+      if (status == Status::ok) ++erased;
+      else if (status == Status::not_found) ++missing;
+      else ++errors;
+    });
+  }
+  for (std::thread& writer : writers) writer.join();
+  CHECK(erased == 1 && missing == 11 && errors == 0 && text(pin) == "value");
+  const nivo::PoolStats stats = f.cache->pool_stats(f.pool).value();
+  CHECK(stats.indexed_items == 0 && stats.counters.inserts == 1 && stats.counters.erases == 1);
+  pin.reset();
+  CHECK(f.cache->stats().allocated_bytes == 0);
+}
+
+void deferred_recency_and_relocation() {
+  std::array<nivo::detail::Entry, 4> entries;
+  nivo::detail::EvictionQueue queue(nivo::EvictionPolicy::lru);
+  for (std::size_t i = 0; i < 3; ++i) queue.insert(entries[i]);
+  std::vector<std::thread> readers;
+  for (std::size_t i = 0; i < 4; ++i) {
+    readers.emplace_back([&] {
+      for (std::size_t j = 0; j < 1000; ++j) queue.record_access(entries[0]);
+    });
+  }
+  for (std::thread& reader : readers) reader.join();
+  queue.record_access(entries[1]);
+  queue.relocate(entries[0], entries[3]);
+  const std::vector<nivo::detail::Entry*> ordered = queue.entries(true);
+  CHECK(ordered.size() == 3 && ordered[0] == &entries[2] && ordered[1] == &entries[3] &&
+        ordered[2] == &entries[1]);
+  queue.remove(entries[2]);
+  queue.clear();
+  CHECK(queue.entries().empty());
+  nivo::detail::EvictionQueue fifo(nivo::EvictionPolicy::fifo);
+  fifo.insert(entries[0]);
+  fifo.insert(entries[1]);
+  fifo.record_access(entries[0]);
+  CHECK(fifo.entries(true)[0] == &entries[0]);
+  fifo.clear();
+}
+
+struct BlockingClock final : nivo::Clock {
+  mutable std::atomic<bool> armed{false};
+  mutable std::mutex mutex;
+  mutable std::condition_variable wakeup;
+  mutable bool entered = false;
+  mutable bool released = false;
+  nivo::Duration now() const noexcept override {
+    if (armed.exchange(false)) {
+      std::unique_lock<std::mutex> lock(mutex);
+      entered = true;
+      wakeup.notify_all();
+      wakeup.wait(lock, [&] { return released; });
+    }
+    return 0ms;
+  }
+  bool wait_until_entered() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    return wakeup.wait_for(lock, 2s, [&] { return entered; });
+  }
+  void release() {
+    std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+    wakeup.notify_all();
+  }
+};
+
+void pool_maintenance_isolation() {
+  std::shared_ptr<BlockingClock> clock = std::make_shared<BlockingClock>();
+  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create({.clock = clock})).value();
+  const nivo::PoolId first = cache->add_pool({"first", 4096}).value();
+  const nivo::PoolId second = cache->add_pool({"second", 4096}).value();
+  CHECK(cache->put(first, "key", bytes("first")));
+  CHECK(cache->put(second, "key", bytes("second")));
+  clock->armed = true;
+  std::future<nivo::Result<std::size_t>> maintenance = std::async(std::launch::async, [&] {
+    return cache->prune_expired(first);
+  });
+  const bool entered = clock->wait_until_entered();
+  std::future<nivo::Result<nivo::ReadHandle>> independent = std::async(std::launch::async, [&] {
+    return cache->find(second, "key");
+  });
+  std::future<nivo::Result<nivo::ReadHandle>> same_pool = std::async(std::launch::async, [&] {
+    return cache->find(first, "key");
+  });
+  const bool parallel = independent.wait_for(2s) == std::future_status::ready;
+  const bool blocked = same_pool.wait_for(20ms) == std::future_status::timeout;
+  clock->release();
+  CHECK(maintenance.get());
+  CHECK(text(independent.get().value()) == "second");
+  CHECK(text(same_pool.get().value()) == "first");
+  CHECK(entered && parallel && blocked);
+}
+
+void pool_read_does_not_serialize_writes() {
+  std::shared_ptr<BlockingClock> clock = std::make_shared<BlockingClock>();
+  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create({.clock = clock})).value();
+  const nivo::PoolId pool = cache->add_pool({"pool", 4096}).value();
+  CHECK(cache->put(pool, "reader", bytes("old")));
+  clock->armed = true;
+  std::future<nivo::Result<nivo::ReadHandle>> reader = std::async(std::launch::async, [&] {
+    return cache->find(pool, "reader");
+  });
+  const bool entered = clock->wait_until_entered();
+  std::future<nivo::Result<nivo::ReadHandle>> writer = std::async(std::launch::async, [&] {
+    return cache->put(pool, "writer", bytes("new"));
+  });
+  const bool parallel = writer.wait_for(2s) == std::future_status::ready;
+  clock->release();
+  CHECK(text(reader.get().value()) == "old" && text(writer.get().value()) == "new");
+  CHECK(entered && parallel);
+}
+
+void concurrent_same_key_snapshots() {
+  Fixture f(1024 * 1024);
+  std::barrier gate(6);
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> workers;
+  for (std::size_t worker = 0; worker < 6; ++worker) {
+    workers.emplace_back([&, worker] {
+      gate.arrive_and_wait();
+      try {
+        for (std::size_t i = 0; i < 1000; ++i) {
+          if (worker < 3) {
+            const std::string value(128, static_cast<char>('a' + worker));
+            nivo::Result<nivo::ReadHandle> result = f.cache->put(f.pool, "shared", bytes(value));
+            CHECK(result && text(result.value()) == value);
+            if (i % 7 == 0) {
+              const Status status = f.cache->erase(f.pool, "shared", result.value().version());
+              CHECK(status == Status::ok || status == Status::not_found || status == Status::version_mismatch);
+            }
+            std::this_thread::yield();
+            CHECK(text(result.value()) == value);
+          } else {
+            nivo::Result<nivo::ReadHandle> result = f.cache->find(f.pool, "shared");
+            if (!result) { CHECK(result.status() == Status::not_found); continue; }
+            const std::string value = text(result.value());
+            CHECK(value.size() == 128 && value.find_first_not_of(value.front()) == std::string::npos);
+            std::this_thread::yield();
+            CHECK(text(result.value()) == value);
+          }
+        }
+      } catch (...) { failed = true; }
+    });
+  }
+  for (std::thread& worker : workers) worker.join();
+  CHECK(!failed);
+  CHECK(f.cache->clear(f.pool) == Status::ok);
+  CHECK(f.cache->stats().allocated_bytes == 0);
+}
+
+
+void shared_mutex_reader_writer_handoff() {
+  nivo::detail::SharedMutex mutex;
+  std::shared_lock<nivo::detail::SharedMutex> first_reader(mutex);
+  std::future<void> second_reader = std::async(std::launch::async, [&] {
+    std::shared_lock<nivo::detail::SharedMutex> lock(mutex);
+  });
+  const bool readers_parallel = second_reader.wait_for(2s) == std::future_status::ready;
+  std::promise<void> writer_entered;
+  std::future<void> entered = writer_entered.get_future();
+  std::promise<void> release_writer;
+  std::shared_future<void> released = release_writer.get_future().share();
+  std::thread writer([&] {
+    std::unique_lock<nivo::detail::SharedMutex> lock(mutex);
+    writer_entered.set_value();
+    released.wait();
+  });
+  const bool writer_blocked = entered.wait_for(20ms) == std::future_status::timeout;
+  first_reader.unlock();
+  const bool writer_progress = entered.wait_for(2s) == std::future_status::ready;
+  std::future<void> late_reader = std::async(std::launch::async, [&] {
+    std::shared_lock<nivo::detail::SharedMutex> lock(mutex);
+  });
+  const bool late_blocked = late_reader.wait_for(20ms) == std::future_status::timeout;
+  release_writer.set_value();
+  writer.join();
+  second_reader.get();
+  late_reader.get();
+  CHECK(readers_parallel && writer_blocked && writer_progress && late_blocked);
+
+  std::size_t left = 0, right = 0;
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> workers;
+  for (std::size_t i = 0; i < 6; ++i) {
+    workers.emplace_back([&, i] {
+      for (std::size_t j = 0; j < 1000; ++j) {
+        if (i < 2) {
+          std::unique_lock<nivo::detail::SharedMutex> lock(mutex);
+          ++left;
+          std::this_thread::yield();
+          ++right;
+        } else {
+          std::shared_lock<nivo::detail::SharedMutex> lock(mutex);
+          if (left != right) failed = true;
+        }
+      }
+    });
+  }
+  for (std::thread& worker : workers) worker.join();
+  CHECK(!failed && left == 2000 && right == 2000);
+}
+
+void concurrent_eviction_and_pool_control() {
+  Fixture f(4096);
+  std::atomic<bool> failed{false};
+  std::barrier gate(5);
+  std::vector<std::thread> workers;
+  for (std::size_t worker = 0; worker < 5; ++worker) {
+    workers.emplace_back([&, worker] {
+      gate.arrive_and_wait();
+      try {
+        for (std::size_t i = 0; i < 400; ++i) {
+          const std::string key = "key-" + std::to_string(i % 64);
+          if (worker < 2) {
+            const std::string value(64, static_cast<char>('a' + worker));
+            nivo::Result<nivo::ReadHandle> result = f.cache->put(f.pool, key, bytes(value), {.ttl = 20ms});
+            if (!result) { CHECK(result.status() == Status::resource_exhausted); continue; }
+            std::this_thread::yield();
+            CHECK(text(result.value()) == value);
+          } else if (worker < 4) {
+            nivo::Result<nivo::ReadHandle> result = f.cache->find(f.pool, key);
+            if (!result) { CHECK(result.status() == Status::not_found); continue; }
+            const std::string value = text(result.value());
+            CHECK(value.size() == 64 && value.find_first_not_of(value.front()) == std::string::npos);
+            std::this_thread::yield();
+            CHECK(text(result.value()) == value);
+          } else {
+            f.clock->advance(1ms);
+            const Status resized = f.cache->resize_pool(f.pool, i % 2 ? 4096 : 512);
+            CHECK(resized == Status::ok || resized == Status::resource_exhausted);
+            if (i % 5 == 0) CHECK(f.cache->clear(f.pool) == Status::ok);
+            else if (i % 3 == 0) CHECK(f.cache->compact(f.pool));
+            else CHECK(f.cache->prune_expired(f.pool));
+            const nivo::PoolStats stats = f.cache->pool_stats(f.pool).value();
+            CHECK(stats.allocated_bytes <= stats.capacity_bytes && stats.indexed_bytes <= stats.allocated_bytes);
+          }
+        }
+      } catch (...) { failed = true; }
+    });
+  }
+  for (std::thread& worker : workers) worker.join();
+  CHECK(!failed);
+  CHECK(f.cache->clear(f.pool) == Status::ok);
+  CHECK(f.cache->stats().allocated_bytes == 0);
+}
+
+void version_source_saturates() {
+  nivo::detail::Owner owner;
+  owner.version.store(std::numeric_limits<nivo::Version>::max() - 1);
+  CHECK(owner.next_version() == std::numeric_limits<nivo::Version>::max());
+  CHECK(owner.next_version() == nivo::invalid_version);
+  CHECK(owner.next_version() == nivo::invalid_version);
+}
+
 }  // namespace
 
 int main() {
   const std::pair<const char*, std::function<void()>> cases[] = {
+    {"index_collision_chain_and_ownership", index_collision_chain_and_ownership},
+    {"index_stripe_parallelism", index_stripe_parallelism},
+    {"concurrent_quota_reservations", concurrent_quota_reservations},
+    {"concurrent_insert_only_and_erase", concurrent_insert_only_and_erase},
+    {"deferred_recency_and_relocation", deferred_recency_and_relocation},
+    {"pool_maintenance_isolation", pool_maintenance_isolation},
+    {"pool_read_does_not_serialize_writes", pool_read_does_not_serialize_writes},
+    {"concurrent_same_key_snapshots", concurrent_same_key_snapshots},
+    {"version_source_saturates", version_source_saturates},
+    {"shared_mutex_reader_writer_handoff", shared_mutex_reader_writer_handoff},
+    {"concurrent_eviction_and_pool_control", concurrent_eviction_and_pool_control},
     {"configuration", configuration}, {"unpublished_and_aborted", unpublished_and_aborted},
     {"publish_and_snapshot", publish_and_snapshot}, {"write_conditions_and_retry", write_conditions_and_retry},
     {"ttl_boundary_and_publish_time", ttl_boundary_and_publish_time}, {"expiry_maintenance", expiry_maintenance},

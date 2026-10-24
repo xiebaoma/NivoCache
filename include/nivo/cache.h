@@ -58,7 +58,7 @@ class Cache final {
   [[nodiscard]] Status clear(PoolId pool);
   // Item expiry is explicit; the optional startup-reserve worker only frees storage.
   [[nodiscard]] Result<std::size_t> prune_expired(PoolId pool);
-  // Synchronously compact one pool or all pools under the cache lock. Prunes
+  // Synchronously compact one pool or all pools under per-pool maintenance guards. Prunes
   // entries expired at the start of the call; preserves versions, TTL and
   // eviction order. Pins, unpublished drafts and direct large allocations are
   // not moved. Regions containing pinned entries or drafts are skipped entirely.

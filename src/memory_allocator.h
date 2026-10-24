@@ -96,7 +96,7 @@ class MemoryAllocator final {
 
   // Candidates are unique live allocations from this allocator. The caller
   // keeps them alive until moved and prevents new allocations or references to
-  // its movable objects for this scope (Cache holds its index lock). Other
+  // its movable objects for this scope (Cache holds its pool maintenance guard). Other
   // threads may return non-candidate allocations. Regions are kept alive until
   // the scope ends, including on failure after partially completed work.
   class Compaction final {
@@ -149,7 +149,7 @@ class MemoryAllocator final {
       // One tightly filled slab per new region avoids speculative storage.
       // Compare before multiplying to keep planning safe for very large pools.
       // Small tail/header savings do not justify copying an otherwise dense
-      // pool under the cache lock. Require a slab and at least one percent.
+      // pool under its maintenance guard. Require a slab and at least one percent.
       const std::size_t minimum_savings = std::max(allocator_.slab_bytes_,
           source_bytes / 100 + (source_bytes % 100 != 0 ? 1 : 0));
       if (destination_slabs > source_bytes / region_bytes ||
