@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <barrier>
+#include <cerrno>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -15,6 +16,13 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
+#if defined(__APPLE__)
+#include <mach/mach_vm.h>
+#endif
 
 using namespace std::chrono_literals;
 using nivo::Status;
@@ -396,6 +404,53 @@ void concurrent_close() {
   CHECK(!failed && text(pinned.value()) == "stable");
 }
 
+void page_memory_mapping_contract() {
+  using Pages = nivo::detail::PageMemory;
+  const std::size_t page = Pages::page_size();
+  CHECK(page > 0);
+  CHECK(Pages::mapping_size(1) == page);
+  CHECK(Pages::mapping_size(page) == page);
+  CHECK(Pages::mapping_size(page + 1) == 2 * page);
+  for (const std::size_t size : {std::size_t{0}, std::numeric_limits<std::size_t>::max(),
+                                 std::numeric_limits<std::size_t>::max() - page + 2}) {
+    bool threw = false;
+    try { (void)Pages::mapping_size(size); } catch (const std::bad_alloc&) { threw = true; }
+    CHECK(threw);
+  }
+  for (const std::size_t size : {std::size_t{0}, page + 1}) {
+    bool threw = false;
+    try { (void)Pages::map(size); } catch (const std::bad_alloc&) { threw = true; }
+    CHECK(threw);
+  }
+  void* memory = Pages::map(2 * page);
+  const bool aligned = reinterpret_cast<std::uintptr_t>(memory) % page == 0;
+  std::byte* payload = static_cast<std::byte*>(memory);
+  const bool zeroed = std::all_of(payload, payload + 2 * page,
+      [](std::byte value) { return value == std::byte{0}; });
+  std::fill_n(payload, 2 * page, std::byte{0x5a});
+  Pages::unmap(memory, 2 * page);
+  // Inspect the address without dereferencing it. This distinguishes actual
+  // unmapping from merely putting storage on an allocator free list.
+#if defined(__APPLE__)
+  mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(memory);
+  mach_vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info{};
+  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object = MACH_PORT_NULL;
+  const kern_return_t result = mach_vm_region(mach_task_self(), &address, &region_size,
+      VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &info_count, &object);
+  if (object != MACH_PORT_NULL) (void)mach_port_deallocate(mach_task_self(), object);
+  CHECK(result == KERN_INVALID_ADDRESS || (result == KERN_SUCCESS &&
+      address >= reinterpret_cast<mach_vm_address_t>(memory) + 2 * page));
+#else
+  unsigned char resident[2]{};
+  errno = 0;
+  const int result = mincore(memory, 2 * page, resident);
+  CHECK(result == -1 && errno == ENOMEM);
+#endif
+  CHECK(aligned && zeroed);
+}
+
 void allocator_size_boundaries() {
   nivo::detail::MemoryAllocator allocator(1024 * 1024);
   for (std::size_t size = 1; size <= 20000; ++size) {
@@ -485,7 +540,7 @@ void allocator_large_and_failure() {
   CHECK(allocator.stats().reserved_bytes == 0);
   const nivo::detail::MemoryAllocator::Allocation block = allocator.allocate(5 * 1024 * 1024 + 1);
   CHECK(allocator.stats().large_allocations == 1);
-  CHECK(allocator.stats().reserved_bytes == block.requested);
+  CHECK(allocator.stats().reserved_bytes == nivo::detail::PageMemory::mapping_size(block.requested));
   allocator.deallocate(block);
   CHECK(allocator.stats().reserved_bytes == 0);
   for (const std::size_t size : {std::size_t{0}, std::numeric_limits<std::size_t>::max()}) {
@@ -659,6 +714,8 @@ struct AllocatorProbe {
   std::vector<std::size_t> requests;
   std::vector<SystemBlock> live;
   std::size_t fail_above = std::numeric_limits<std::size_t>::max();
+  std::size_t fail_after = std::numeric_limits<std::size_t>::max();
+  std::int64_t allocation_delay_ms = 0;
   bool fail_all = false;
   bool invalid_delete = false;
 
@@ -669,19 +726,23 @@ struct AllocatorProbe {
   static void* allocate(void* context, std::size_t bytes) {
     AllocatorProbe& probe = *static_cast<AllocatorProbe*>(context);
     probe.requests.push_back(bytes);
-    if (probe.fail_all || bytes > probe.fail_above) throw std::bad_alloc();
-    void* data = ::operator new(bytes);
+    if (probe.fail_all || bytes > probe.fail_above || probe.requests.size() > probe.fail_after)
+      throw std::bad_alloc();
+    probe.milliseconds.fetch_add(probe.allocation_delay_ms);
+    void* data = nivo::detail::PageMemory::map(bytes);
     try { probe.live.push_back({data, bytes}); }
-    catch (...) { ::operator delete(data); throw; }
+    catch (...) { nivo::detail::PageMemory::unmap(data, bytes); throw; }
     return data;
   }
-  static void deallocate(void* context, void* data) noexcept {
+  static void deallocate(void* context, void* data, std::size_t bytes) noexcept {
     AllocatorProbe& probe = *static_cast<AllocatorProbe*>(context);
     std::vector<SystemBlock>::iterator it = std::find_if(probe.live.begin(), probe.live.end(),
         [data](const SystemBlock& block) { return block.data == data; });
     if (it == probe.live.end()) { probe.invalid_delete = true; return; }
+    if (it->bytes != bytes) probe.invalid_delete = true;
+    const std::size_t mapped_bytes = it->bytes;
     probe.live.erase(it);
-    ::operator delete(data);
+    nivo::detail::PageMemory::unmap(data, mapped_bytes);
   }
   Allocator::Hooks hooks() noexcept { return {this, now, allocate, deallocate}; }
 };
@@ -1453,9 +1514,11 @@ void memory_monitor_large_allocations_and_close() {
   nivo::WriteHandle draft = std::move(f.cache->allocate(f.pool, "large", 100000)).value();
   const nivo::MemoryStats memory = f.cache->memory_stats(f.pool).value();
   CHECK(valid_memory_breakdown(memory));
-  CHECK(memory.kv_bytes == 100005 && memory.reserved_bytes == memory.kv_bytes + memory.entry_metadata_bytes);
+  CHECK(memory.kv_bytes == 100005 && memory.reserved_bytes ==
+      nivo::detail::PageMemory::mapping_size(memory.kv_bytes + memory.entry_metadata_bytes));
   CHECK(memory.allocator_metadata_bytes == 0 && memory.internal_fragmentation_bytes == 0);
-  CHECK(memory.unused_bytes == 0 && memory.reclaimable_bytes == 0);
+  CHECK(memory.unused_bytes == memory.reserved_bytes - memory.kv_bytes - memory.entry_metadata_bytes);
+  CHECK(memory.unused_bytes < nivo::detail::PageMemory::page_size() && memory.reclaimable_bytes == 0);
   f.cache->close();
   CHECK(f.cache->memory_stats().total.retained_kv_bytes == 100005);
   draft.reset();
@@ -1583,6 +1646,263 @@ void memory_monitor_rss_parser() {
   CHECK(!nivo::detail::rss_from_statm(overflow, 4096));
 }
 
+void initial_reserve_configuration_and_monitoring() {
+  constexpr std::size_t mib = 1024 * 1024;
+  Fixture f(8 * mib);
+  CHECK(f.cache->memory_stats(f.pool).value().reserved_bytes == 0);
+  CHECK(nivo::PoolConfig{}.initial_reserve_bytes == 0);
+  CHECK(nivo::PoolConfig{}.initial_reserve_timeout == 30s);
+  CHECK(f.cache->add_pool({.name = "invalid", .capacity_bytes = mib,
+      .initial_reserve_bytes = mib + 1}).status() == Status::invalid_argument);
+  CHECK(f.cache->add_pool({.name = "invalid", .capacity_bytes = mib,
+      .initial_reserve_bytes = 1, .initial_reserve_timeout = 0ms}).status() == Status::invalid_argument);
+  CHECK(f.cache->add_pool({.name = "invalid", .capacity_bytes = mib,
+      .initial_reserve_timeout = -1ms}).status() == Status::invalid_argument);
+  CHECK(f.cache->add_pool({.name = "invalid", .capacity_bytes = mib,
+      .initial_reserve_bytes = 1, .initial_reserve_timeout = nivo::Duration::max()}).status() ==
+      Status::invalid_argument);
+  CHECK(f.cache->stats().pools == 1 && f.cache->stats().assigned_bytes == 8 * mib);
+  const nivo::PoolId pool = f.cache->add_pool({.name = "reserved", .capacity_bytes = 8 * mib,
+      .initial_reserve_bytes = mib + 1}).value();
+  CHECK(pool == f.pool + 1);
+  const nivo::AllocatorStats prepared = f.cache->pool_stats(pool).value().allocator;
+  CHECK(prepared.slabs == 17 && prepared.empty_slabs == 17 && prepared.regions == 3);
+  CHECK(prepared.reserved_bytes > mib + 65536 && prepared.live_allocations == 0);
+  const nivo::CacheMemoryStats sample = f.cache->memory_stats();
+  CHECK(valid_memory_breakdown(sample.total));
+  CHECK(sample.total.reserved_bytes == prepared.reserved_bytes);
+  CHECK(sample.total.reclaimable_bytes == sample.total.reserved_bytes);
+  CHECK(sample.total.unused_bytes > mib && sample.total.kv_bytes == 0);
+  CHECK(f.cache->put(pool, "key", bytes("value")));
+  CHECK(f.cache->pool_stats(pool).value().allocator.system_allocations == prepared.system_allocations);
+  CHECK(f.cache->memory_stats(f.pool).value().reserved_bytes == 0);
+  CHECK(f.cache->clear(pool) == Status::ok);
+  CHECK(f.cache->memory_stats(pool).value().reserved_bytes == 0);
+  // Clearing cancels startup retention; it never recreates the initial reserve.
+  CHECK(f.cache->put(pool, "again", bytes("value")));
+  CHECK(f.cache->memory_stats(pool).value().reserved_bytes < 2 * 65536);
+}
+
+void initial_reserve_deadline_and_failure() {
+  using Allocator = nivo::detail::MemoryAllocator;
+  constexpr std::size_t mib = 1024 * 1024;
+  AllocatorProbe probe;
+  probe.allocation_delay_ms = 200;
+  Allocator allocator(8 * mib, probe.hooks());
+  allocator.reserve_initial(mib, 1000ms);
+  const nivo::AllocatorStats prepared = allocator.inspect();
+  CHECK(probe.milliseconds == 400 && prepared.regions == 2);
+  CHECK(allocator.maintain_initial_reserve().value() == Allocator::TimePoint{} + 1400ms);
+  probe.milliseconds = 1399;
+  AllocatorBlocks blocks(allocator);
+  blocks.add(256);
+  blocks.clear();
+  CHECK(allocator.stats().reserved_bytes == prepared.reserved_bytes);
+  CHECK(allocator.stats().system_allocations == prepared.system_allocations);
+  CHECK(allocator.maintain_initial_reserve().has_value());
+  probe.milliseconds = 1400;
+  CHECK(!allocator.maintain_initial_reserve());
+  CHECK(allocator.inspect().reserved_bytes == 0 && probe.live.empty());
+  blocks.add(256);
+  CHECK(allocator.inspect().slabs == 1);
+  blocks.clear();
+  allocator.trim();
+
+  AllocatorProbe failed;
+  failed.fail_after = 2;
+  Allocator broken(8 * mib, failed.hooks());
+  bool threw = false;
+  try { broken.reserve_initial(2 * mib, 1s); }
+  catch (const std::bad_alloc&) { threw = true; }
+  CHECK(threw && failed.requests.size() == 3);
+  CHECK(failed.live.empty() && !failed.invalid_delete);
+  CHECK(broken.inspect().reserved_bytes == 0 && broken.inspect().metadata_bytes == 0);
+  CHECK(!broken.maintain_initial_reserve());
+}
+
+void initial_reserve_partial_use_resize_and_trim() {
+  constexpr std::size_t mib = 1024 * 1024;
+  AllocatorProbe probe;
+  nivo::detail::MemoryAllocator allocator(8 * mib, probe.hooks());
+  allocator.reserve_initial(4 * mib, 100ms);
+  AllocatorBlocks blocks(allocator);
+  blocks.add(15000);
+  const nivo::AllocatorStats before = allocator.inspect();
+  CHECK(before.regions == 8 && before.slabs == 64);
+  probe.milliseconds = 100;
+  CHECK(!allocator.maintain_initial_reserve());
+  const nivo::AllocatorStats after = allocator.inspect();
+  CHECK(after.regions == 1 && after.slabs == 8 && after.live_allocations == 1);
+  CHECK(after.reserved_bytes < before.reserved_bytes / 4);
+  CHECK(static_cast<std::byte*>(blocks.blocks[0].data)[14999] == std::byte{0x5a});
+  blocks.clear();
+  CHECK(allocator.inspect().reserved_bytes == 0);
+
+  Fixture f(8 * mib);
+  const nivo::PoolId pool = f.cache->add_pool({.name = "resize", .capacity_bytes = 8 * mib,
+      .initial_reserve_bytes = 4 * mib}).value();
+  CHECK(f.cache->resize_pool(pool, mib) == Status::ok);
+  CHECK(f.cache->memory_stats(pool).value().reserved_bytes == 0);
+  CHECK(f.cache->resize_pool(pool, 8 * mib) == Status::ok);
+  CHECK(f.cache->memory_stats(pool).value().reserved_bytes == 0);
+}
+
+bool wait_for_reserve_release(nivo::Cache& cache, nivo::PoolId pool, std::size_t below) {
+  const std::chrono::steady_clock::time_point limit = std::chrono::steady_clock::now() + 5s;
+  do {
+    // Pure observation cannot trigger cooling or reclamation.
+    if (cache.memory_stats(pool).value().reserved_bytes < below) return true;
+    std::this_thread::sleep_for(2ms);
+  } while (std::chrono::steady_clock::now() < limit);
+  return false;
+}
+
+void initial_reserve_background_idle_expiry() {
+  constexpr std::size_t mib = 1024 * 1024;
+  Fixture f(8 * mib);
+  const nivo::PoolId later = f.cache->add_pool({.name = "later", .capacity_bytes = 4 * mib,
+      .initial_reserve_bytes = 2 * mib, .initial_reserve_timeout = 30s}).value();
+  // Let the existing worker enter its long wait before adding an earlier timer.
+  std::this_thread::sleep_for(20ms);
+  const nivo::PoolId sooner = f.cache->add_pool({.name = "sooner", .capacity_bytes = 4 * mib,
+      .initial_reserve_bytes = 2 * mib, .initial_reserve_timeout = 100ms}).value();
+  CHECK(f.cache->memory_stats(sooner).value().reserved_bytes > 2 * mib);
+  // The item TTL clock is frozen; reserve deadlines use elapsed real time.
+  CHECK(wait_for_reserve_release(*f.cache, sooner, 1));
+  CHECK(f.clock->now() == 0ms);
+  CHECK(f.cache->memory_stats(later).value().reserved_bytes > 2 * mib);
+  CHECK(f.cache->put(sooner, "after", bytes("expiry")));
+  CHECK(f.cache->memory_stats(sooner).value().reserved_bytes < 2 * 65536);
+  f.cache->close();
+  CHECK(f.cache->memory_stats().total.reserved_bytes == 0);
+}
+
+void initial_reserve_background_live_data_and_lifetime() {
+  constexpr std::size_t mib = 1024 * 1024;
+  nivo::ReadHandle pinned;
+  {
+    Fixture f(8 * mib);
+    const nivo::PoolId pool = f.cache->add_pool({.name = "live", .capacity_bytes = 8 * mib,
+        .initial_reserve_bytes = 4 * mib, .initial_reserve_timeout = 100ms}).value();
+    pinned = std::move(f.cache->put(pool, "key", bytes("value"))).value();
+    CHECK(wait_for_reserve_release(*f.cache, pool, mib));
+    CHECK(text(pinned) == "value");
+    const nivo::MemoryStats memory = f.cache->memory_stats(pool).value();
+    CHECK(valid_memory_breakdown(memory) && memory.kv_bytes == 8 && memory.indexed_kv_bytes == 8);
+    f.cache->close();
+    CHECK(f.cache->memory_stats(pool).value().retained_kv_bytes == 8);
+  }
+  CHECK(text(pinned) == "value");
+  std::thread releaser([handle = std::move(pinned)]() mutable { handle.reset(); });
+  releaser.join();
+  // Destruction must wake a worker whose deadline is still far in the future.
+  const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  {
+    Fixture f(8 * mib);
+    CHECK(f.cache->add_pool({.name = "long", .capacity_bytes = 8 * mib,
+        .initial_reserve_bytes = mib, .initial_reserve_timeout = 1h}));
+  }
+  CHECK(std::chrono::steady_clock::now() - start < 5s);
+}
+
+void initial_reserve_concurrent_expiry_and_compaction() {
+  constexpr std::size_t mib = 1024 * 1024;
+  Fixture f(8 * mib);
+  const nivo::PoolId pool = f.cache->add_pool({.name = "concurrent", .capacity_bytes = 8 * mib,
+      .initial_reserve_bytes = 4 * mib, .initial_reserve_timeout = 20ms}).value();
+  std::atomic<bool> valid{true};
+  std::vector<std::thread> writers;
+  for (unsigned worker = 0; worker < 4; ++worker) {
+    writers.emplace_back([&, worker] {
+      const std::string key = std::to_string(worker);
+      for (unsigned i = 0; i < 100; ++i) {
+        nivo::Result<nivo::ReadHandle> result = f.cache->put(pool, key, bytes("value"));
+        if (!result || text(result.value()) != "value") valid = false;
+        if (!valid_memory_breakdown(f.cache->memory_stats(pool).value())) valid = false;
+        std::this_thread::sleep_for(1ms);
+      }
+    });
+  }
+  for (std::thread& writer : writers) writer.join();
+  CHECK(valid && wait_for_reserve_release(*f.cache, pool, mib));
+  CHECK(f.cache->compact(pool));
+  for (unsigned worker = 0; worker < 4; ++worker)
+    CHECK(text(f.cache->peek(pool, std::to_string(worker)).value()) == "value");
+  CHECK(f.cache->clear(pool) == Status::ok);
+  CHECK(f.cache->memory_stats(pool).value().reserved_bytes == 0);
+
+  Fixture empty(8 * mib);
+  const nivo::PoolId reserved = empty.cache->add_pool({.name = "compact", .capacity_bytes = 8 * mib,
+      .initial_reserve_bytes = 4 * mib}).value();
+  CHECK(empty.cache->compact(reserved));
+  CHECK(empty.cache->memory_stats(reserved).value().reserved_bytes == 0);
+}
+
+#if defined(__unix__) || defined(__APPLE__)
+struct MappedReserveProbe {
+  using Allocator = nivo::detail::MemoryAllocator;
+  struct Block { void* address; std::size_t bytes; };
+  std::vector<Block> blocks;
+  std::size_t cold_pages = 0;
+  bool invalid = false;
+  static std::size_t resident_pages(void* data, std::size_t bytes) {
+    const std::size_t page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+#if defined(__APPLE__)
+    std::vector<char> resident((bytes - 1) / page_size + 1);
+#else
+    std::vector<unsigned char> resident((bytes - 1) / page_size + 1);
+#endif
+    CHECK(mincore(data, bytes, resident.data()) == 0);
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < resident.size(); ++i)
+      if ((resident[i] & 1) != 0) ++count;
+    return count;
+  }
+  static void* allocate(void* context, std::size_t bytes) {
+    MappedReserveProbe& probe = *static_cast<MappedReserveProbe*>(context);
+    void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (data == MAP_FAILED) throw std::bad_alloc();
+    try {
+      const std::size_t page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+      probe.cold_pages += (bytes - 1) / page_size + 1 - resident_pages(data, bytes);
+      probe.blocks.push_back({data, bytes});
+    } catch (...) {
+      munmap(data, bytes);
+      throw;
+    }
+    return data;
+  }
+  static void deallocate(void* context, void* data, std::size_t bytes) noexcept {
+    MappedReserveProbe& probe = *static_cast<MappedReserveProbe*>(context);
+    const std::vector<Block>::iterator found = std::find_if(probe.blocks.begin(), probe.blocks.end(),
+        [data](const Block& block) { return block.address == data; });
+    if (found == probe.blocks.end()) { probe.invalid = true; return; }
+    if (found->bytes != bytes) probe.invalid = true;
+    if (munmap(data, found->bytes) != 0) probe.invalid = true;
+    probe.blocks.erase(found);
+  }
+};
+#endif
+
+void initial_reserve_pages_are_resident() {
+#if defined(__unix__) || defined(__APPLE__)
+  using Allocator = nivo::detail::MemoryAllocator;
+  MappedReserveProbe probe;
+  Allocator::Hooks hooks;
+  hooks.context = &probe;
+  hooks.allocate = MappedReserveProbe::allocate;
+  hooks.deallocate = MappedReserveProbe::deallocate;
+  Allocator allocator(8 * 1024 * 1024, hooks);
+  allocator.reserve_initial(2 * 1024 * 1024, 30s);
+  CHECK(probe.cold_pages > 0);
+  const std::size_t page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  for (const MappedReserveProbe::Block& block : probe.blocks)
+    CHECK(MappedReserveProbe::resident_pages(block.address, block.bytes) == (block.bytes - 1) / page_size + 1);
+  allocator.trim();
+  CHECK(probe.blocks.empty() && !probe.invalid);
+#endif
+}
+
 void allocator_compaction_skips_marginal_savings() {
   using Allocator = nivo::detail::MemoryAllocator;
   AllocatorProbe probe;
@@ -1619,6 +1939,7 @@ int main() {
     {"result_contract", result_contract}, {"concurrent_cas", concurrent_cas},
     {"concurrent_operations", concurrent_operations}, {"concurrent_close", concurrent_close},
     {"allocator_size_boundaries", allocator_size_boundaries},
+    {"page_memory_mapping_contract", page_memory_mapping_contract},
     {"allocator_reuse_and_reclassification", allocator_reuse_and_reclassification},
     {"allocator_mixed_slabs", allocator_mixed_slabs},
     {"allocator_full_slab_reuse", allocator_full_slab_reuse},
@@ -1662,6 +1983,13 @@ int main() {
     {"memory_monitor_idle_and_partial_regions", memory_monitor_idle_and_partial_regions},
     {"memory_monitor_concurrent_handle_release", memory_monitor_concurrent_handle_release},
     {"memory_monitor_rss_parser", memory_monitor_rss_parser},
+    {"initial_reserve_configuration_and_monitoring", initial_reserve_configuration_and_monitoring},
+    {"initial_reserve_deadline_and_failure", initial_reserve_deadline_and_failure},
+    {"initial_reserve_partial_use_resize_and_trim", initial_reserve_partial_use_resize_and_trim},
+    {"initial_reserve_background_idle_expiry", initial_reserve_background_idle_expiry},
+    {"initial_reserve_background_live_data_and_lifetime", initial_reserve_background_live_data_and_lifetime},
+    {"initial_reserve_concurrent_expiry_and_compaction", initial_reserve_concurrent_expiry_and_compaction},
+    {"initial_reserve_pages_are_resident", initial_reserve_pages_are_resident},
     {"allocator_compaction_skips_marginal_savings", allocator_compaction_skips_marginal_savings}
   };
   unsigned failures = 0;

@@ -11,10 +11,13 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "nivo/stats.h"
+#include "page_memory.h"
 
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
@@ -49,7 +52,7 @@ class MemoryAllocator final {
     std::size_t class_id = 0;
   };
 
-  // One system allocation contains this header and all of its slabs. Regions
+  // One OS mapping contains this header and all of its slabs. Regions
   // are released only when every slab is empty. Only explicit compaction moves
   // eligible entries; normal allocation and reclamation preserve addresses.
   struct alignas(std::max_align_t) Region {
@@ -60,23 +63,27 @@ class MemoryAllocator final {
     Slab* empty = nullptr;
     std::size_t slab_count = 0;
     std::size_t active_slabs = 0;
+    std::size_t mapped_bytes = 0;
+    bool initial_reserve = false;
   };
 
  public:
   using TimePoint = std::chrono::steady_clock::time_point;
   // Internal dependency seam for deterministic timing and allocation failures.
   // The context must outlive the allocator. Returned memory must have the same
-  // alignment as operator new; allocation may throw bad_alloc.
+  // alignment as max_align_t; allocation may throw bad_alloc. Allocation and
+  // release receive the same page-rounded mapping length.
   struct Hooks {
     void* context = nullptr;
     TimePoint (*now)(void*) noexcept = [](void*) noexcept -> TimePoint {
       return std::chrono::steady_clock::now();
     };
     void* (*allocate)(void*, std::size_t) = [](void*, std::size_t size) -> void* {
-      return ::operator new(size);
+      return PageMemory::map(size);
     };
-    void (*deallocate)(void*, void*) noexcept = [](void*, void* data) noexcept {
-      ::operator delete(data);
+    void (*deallocate)(void*, void*, std::size_t) noexcept =
+        [](void*, void* data, std::size_t size) noexcept {
+      PageMemory::unmap(data, size);
     };
   };
 
@@ -84,6 +91,7 @@ class MemoryAllocator final {
     void* data = nullptr;
     Slab* slab = nullptr;  // null identifies a direct large allocation
     std::size_t requested = 0;
+    std::size_t mapped_bytes = 0;  // direct allocations only; slabs use their region
   };
 
   // Candidates are unique live allocations from this allocator. The caller
@@ -119,7 +127,7 @@ class MemoryAllocator final {
         // represented by movable candidates; moving part would strand storage.
         if (live == end - first) {
           regions_.push_back(region);
-          source_bytes += sizeof(Region) + region->slab_count * allocator_.slab_bytes_;
+          source_bytes += region->mapped_bytes;
         }
         first = end;
       }
@@ -137,7 +145,7 @@ class MemoryAllocator final {
         const std::size_t per_slab = (allocator_.slab_bytes_ - sizeof(Slab)) / sizes[id];
         destination_slabs += (counts[id] - 1) / per_slab + 1;
       }
-      const std::size_t region_bytes = sizeof(Region) + allocator_.slab_bytes_;
+      const std::size_t region_bytes = allocator_.region_mapping_size(1);
       // One tightly filled slab per new region avoids speculative storage.
       // Compare before multiplying to keep planning safe for very large pools.
       // Small tail/header savings do not justify copying an otherwise dense
@@ -158,6 +166,7 @@ class MemoryAllocator final {
       std::lock_guard<std::mutex> lock(allocator_.mutex_);
       if (active_) allocator_.compacting_ = false;
       allocator_.reset_policy();
+      allocator_.cancel_initial_reserve();
       allocator_.release_idle_regions(0);
     }
 
@@ -203,11 +212,48 @@ class MemoryAllocator final {
   MemoryAllocator& operator=(const MemoryAllocator&) = delete;
   ~MemoryAllocator() {
     assert(stats_.live_allocations == 0);
+    cancel_initial_reserve();
     release_idle_regions(0);
     assert(stats_.regions == 0);
   }
 
   std::atomic<std::size_t> used{0};  // logical key + value budget
+
+  // Called once on a new allocator, before publication to the cache. Small
+  // independent regions bound the storage pinned by a sparsely used reserve.
+  void reserve_initial(std::size_t bytes, Duration timeout) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    assert(stats_.system_allocations == 0);
+    if (bytes > capacity_ || timeout.count() <= 0)
+      throw std::invalid_argument("Invalid initial reserve configuration");
+    if (bytes == 0) return;
+    if (timeout > std::chrono::duration_cast<Duration>(TimePoint::max() - hooks_.now(hooks_.context)))
+      throw std::invalid_argument("Initial reserve timeout is too large");
+    try {
+      std::size_t slabs = (bytes - 1) / slab_bytes_ + 1;
+      while (slabs != 0) {
+        const std::size_t count = std::min(slabs, std::size_t{8});
+        create_region(count, true);
+        slabs -= count;
+      }
+      const TimePoint ready = hooks_.now(hooks_.context);
+      if (timeout > std::chrono::duration_cast<Duration>(TimePoint::max() - ready))
+        throw std::invalid_argument("Initial reserve timeout is too large");
+      initial_reserve_deadline_ = ready + timeout;
+      initial_idle_slabs_ = stats_.empty_slabs;
+    } catch (...) {
+      cancel_initial_reserve();
+      release_idle_regions(0);
+      throw;
+    }
+  }
+
+  // Cache owns the timer; allocator hooks keep deadline behavior testable.
+  [[nodiscard]] std::optional<TimePoint> maintain_initial_reserve() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (initial_reserve_deadline_) cool(hooks_.now(hooks_.context));
+    return initial_reserve_deadline_;
+  }
 
   [[nodiscard]] Allocation allocate(std::size_t size) {
     if (size == 0 || size > std::numeric_limits<std::size_t>::max() - alignment)
@@ -218,16 +264,17 @@ class MemoryAllocator final {
     // item limit. Small pools use smaller slabs without reserving their quota.
     if (slot_size > (slab_bytes_ - sizeof(Slab)) / 4) {
       cool(hooks_.now(hooks_.context));
-      if (size > std::numeric_limits<std::size_t>::max() - stats_.reserved_bytes)
+      const std::size_t mapped_bytes = PageMemory::mapping_size(size);
+      if (mapped_bytes > std::numeric_limits<std::size_t>::max() - stats_.reserved_bytes)
         throw std::bad_alloc();
-      void* data = system_allocate(size);
-      stats_.reserved_bytes += size;
+      void* data = system_allocate(mapped_bytes);
+      stats_.reserved_bytes += mapped_bytes;
       stats_.active_bytes += size;
       stats_.requested_bytes += size;
       ++stats_.live_allocations;
       ++stats_.large_allocations;
       ++stats_.system_allocations;
-      return {data, nullptr, size};
+      return {data, nullptr, size, mapped_bytes};
     }
     const std::size_t id = class_index(slot_size);
     Slab* slab = available_[id];
@@ -252,9 +299,9 @@ class MemoryAllocator final {
     Slab* slab = allocation.slab;
     if (!slab) {
       stats_.active_bytes -= allocation.requested;
-      stats_.reserved_bytes -= allocation.requested;
+      stats_.reserved_bytes -= allocation.mapped_bytes;
       --stats_.large_allocations;
-      hooks_.deallocate(hooks_.context, allocation.data);
+      hooks_.deallocate(hooks_.context, allocation.data, allocation.mapped_bytes);
       return;
     }
     stats_.active_bytes -= slab->slot_size;
@@ -276,6 +323,7 @@ class MemoryAllocator final {
   void trim(bool release_future_empty_slabs = false) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (release_future_empty_slabs) retain_spares_ = false;
+    cancel_initial_reserve();
     reset_policy();
     release_idle_regions(0);
   }
@@ -283,13 +331,14 @@ class MemoryAllocator final {
   void resize(std::size_t capacity) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     capacity_ = capacity;
+    cancel_initial_reserve();
     update_reserve_limit();
     reset_policy();
     release_idle_regions(0);
   }
 
   // Cooling is opportunistic: slab acquisition/return and statistics sampling
-  // perform maintenance. There is no background thread or per-item timer.
+  // perform maintenance. The cache separately schedules startup-reserve expiry.
   [[nodiscard]] AllocatorStats stats() {
     std::lock_guard<std::mutex> lock(mutex_);
     cool(hooks_.now(hooks_.context));
@@ -366,6 +415,8 @@ class MemoryAllocator final {
   }
   void cool(TimePoint now) noexcept {
     if (compacting_) return;
+    if (initial_reserve_deadline_ && now >= *initial_reserve_deadline_)
+      cancel_initial_reserve();
     constexpr std::chrono::milliseconds interval{500};
     if (have_refill_ && now >= last_decay_ && now - last_decay_ >= interval) {
       const std::chrono::steady_clock::duration elapsed = now - last_decay_;
@@ -406,6 +457,9 @@ class MemoryAllocator final {
         (headroom - sizeof(Region)) / slab_bytes_ : 0;
     std::size_t count = std::min({stats_.refill_batch_size, spare_room + 1,
                                  std::max(std::size_t{1}, affordable)});
+    // Page rounding also consumes headroom. Never prefetch extra slabs beyond
+    // the logical capacity merely because their unrounded layout would fit.
+    while (count > 1 && region_mapping_size(count) > headroom) --count;
     try {
       create_region(count);
     } catch (const std::bad_alloc&) {
@@ -422,15 +476,39 @@ class MemoryAllocator final {
     last_refill_slabs_ = count;
   }
 
-  Region* create_region(std::size_t count) {
-    const std::size_t bytes = sizeof(Region) + count * slab_bytes_;
+  static void prefault(void* data, std::size_t bytes) noexcept {
+    const std::size_t page_size = PageMemory::page_size();
+    // Volatile writes cannot be optimized away or satisfied by a shared zero
+    // page. The last byte covers the final page of an unaligned allocation.
+    volatile unsigned char* memory = static_cast<volatile unsigned char*>(data);
+    for (std::size_t offset = 0; offset < bytes; offset += page_size) memory[offset] = 0;
+    memory[bytes - 1] = 0;
+  }
+
+  void cancel_initial_reserve() noexcept {
+    initial_reserve_deadline_.reset();
+    initial_idle_slabs_ = 0;
+  }
+
+  std::size_t region_mapping_size(std::size_t count) const {
+    if (count == 0 || count > (std::numeric_limits<std::size_t>::max() - sizeof(Region)) / slab_bytes_)
+      throw std::bad_alloc();
+    return PageMemory::mapping_size(sizeof(Region) + count * slab_bytes_);
+  }
+
+  Region* create_region(std::size_t count, bool initial_reserve = false) {
+    const std::size_t bytes = region_mapping_size(count);
     if (bytes > std::numeric_limits<std::size_t>::max() - stats_.reserved_bytes)
       throw std::bad_alloc();
-    Region* region = new (system_allocate(bytes)) Region{};
+    void* memory = system_allocate(bytes);
+    if (initial_reserve) prefault(memory, bytes);
+    Region* region = new (memory) Region{};
     region->slab_count = count;
+    region->mapped_bytes = bytes;
+    region->initial_reserve = initial_reserve;
     for (std::size_t i = count; i > 0; --i) {
-      void* memory = reinterpret_cast<std::byte*>(region) + sizeof(Region) + (i - 1) * slab_bytes_;
-      Slab* slab = new (memory) Slab{};
+      void* slab_memory = reinterpret_cast<std::byte*>(region) + sizeof(Region) + (i - 1) * slab_bytes_;
+      Slab* slab = new (slab_memory) Slab{};
       slab->region = region;
       slab->next = region->empty;
       region->empty = slab;
@@ -494,7 +572,9 @@ class MemoryAllocator final {
     region->available_previous = region->available_next = nullptr;
   }
   void link_idle(Region* region) noexcept {
-    stats_.reclaimable_bytes += sizeof(Region) + region->slab_count * slab_bytes_;
+    if (initial_reserve_deadline_ && region->initial_reserve)
+      initial_idle_slabs_ += region->slab_count;
+    stats_.reclaimable_bytes += region->mapped_bytes;
     region->idle_previous = idle_tail_;
     region->idle_next = nullptr;
     if (idle_tail_) idle_tail_->idle_next = region;
@@ -502,7 +582,9 @@ class MemoryAllocator final {
     idle_tail_ = region;
   }
   void unlink_idle(Region* region) noexcept {
-    stats_.reclaimable_bytes -= sizeof(Region) + region->slab_count * slab_bytes_;
+    if (initial_reserve_deadline_ && region->initial_reserve)
+      initial_idle_slabs_ -= region->slab_count;
+    stats_.reclaimable_bytes -= region->mapped_bytes;
     if (region->idle_previous) region->idle_previous->idle_next = region->idle_next;
     else idle_regions_ = region->idle_next;
     if (region->idle_next) region->idle_next->idle_previous = region->idle_previous;
@@ -511,14 +593,17 @@ class MemoryAllocator final {
   }
   void release_idle_regions(std::size_t keep_slabs) noexcept {
     if (compacting_) return;
-    // Empty slabs in a partly occupied region cannot be individually deleted.
+    // Empty slabs in a partly occupied region cannot be individually unmapped.
     // Include them in the reserve count, but release only wholly idle regions.
-    while (idle_regions_ && stats_.empty_slabs > keep_slabs) {
-      Region* region = idle_regions_;
+    Region* candidate = idle_regions_;
+    while (candidate && stats_.empty_slabs - initial_idle_slabs_ > keep_slabs) {
+      Region* region = candidate;
+      candidate = region->idle_next;
+      if (initial_reserve_deadline_ && region->initial_reserve) continue;
       unlink_idle(region);
       unlink_region(region);
       const std::size_t count = region->slab_count;
-      const std::size_t bytes = sizeof(Region) + count * slab_bytes_;
+      const std::size_t bytes = region->mapped_bytes;
       unpoison(region, bytes);
       for (std::size_t i = 0; i < count; ++i) {
         Slab* slab = reinterpret_cast<Slab*>(reinterpret_cast<std::byte*>(region) +
@@ -526,7 +611,7 @@ class MemoryAllocator final {
         slab->~Slab();
       }
       region->~Region();
-      hooks_.deallocate(hooks_.context, region);
+      hooks_.deallocate(hooks_.context, region, bytes);
       stats_.reserved_bytes -= bytes;
       stats_.metadata_bytes -= sizeof(Region) + count * sizeof(Slab);
       stats_.slabs -= count;
@@ -566,6 +651,8 @@ class MemoryAllocator final {
   std::size_t last_refill_slabs_ = 1;
   TimePoint last_refill_{};
   TimePoint last_decay_{};
+  std::optional<TimePoint> initial_reserve_deadline_;
+  std::size_t initial_idle_slabs_ = 0;
   AllocatorStats stats_;
 };
 }  // namespace nivo::detail

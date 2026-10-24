@@ -9,12 +9,12 @@
 #include "nivo/config.h"
 
 namespace nivo {
-// Item storage only: excludes indexes, pool objects and system allocator overhead.
+// Item storage mappings only: excludes indexes, pool objects and OS page tables.
 // These figures describe allocator-owned bytes, not process RSS.
 struct AllocatorStats {
   std::size_t requested_bytes = 0;  // live entry metadata, keys and values
   std::size_t active_bytes = 0;     // live size-class slots (including rounding)
-  std::size_t reserved_bytes = 0;   // regions/slabs (including headers) and large blocks
+  std::size_t reserved_bytes = 0;   // mapped regions and large blocks, including page rounding
   std::size_t live_allocations = 0;
   std::size_t slabs = 0;
   std::size_t large_allocations = 0;
@@ -22,7 +22,7 @@ struct AllocatorStats {
   std::uint64_t reused_allocations = 0;
   std::size_t regions = 0;         // independently releasable slab batches
   std::size_t empty_slabs = 0;     // includes empty slabs pinned by a live region
-  std::size_t reserve_limit_bytes = 0;  // speculative storage budget, not an RSS cap
+  std::size_t reserve_limit_bytes = 0;  // adaptive reserve budget; excludes startup reserve, not an RSS cap
   std::size_t refill_batch_size = 1;    // target; cache aggregate reports the maximum
   std::uint64_t batch_refills = 0;
   std::uint64_t batch_fallbacks = 0;     // failed batches retried with one slab
@@ -31,9 +31,9 @@ struct AllocatorStats {
 };
 
 // Current item-storage gauges, in bytes. reserved_bytes is the outstanding
-// amount requested from the system allocator, NOT process RSS. It excludes
-// indexes, queue nodes, pool/cache objects, temporary compaction plans, and
-// system allocator bookkeeping/rounding. These are not estimates of total RSS.
+// OS mapping size including page rounding, NOT process RSS. It excludes indexes,
+// queue nodes, pool/cache objects, temporary compaction plans and OS page tables.
+// Mapped pages need not be resident. These are not estimates of total RSS.
 struct MemoryStats {
   std::size_t reserved_bytes = 0;
   // Every allocated key+value: indexed entries, drafts and detached snapshots.
@@ -45,8 +45,8 @@ struct MemoryStats {
   std::size_t entry_metadata_bytes = 0;
   std::size_t allocator_metadata_bytes = 0;
   std::size_t internal_fragmentation_bytes = 0;  // live slot rounding only
-  // Unoccupied slab payload, including unusable tails. Reusable space is not
-  // necessarily releasable while other allocations keep its region alive.
+  // Unoccupied slab payload and mapping padding, including unusable tails.
+  // Not all unused bytes are reusable or releasable while a region is live.
   std::size_t unused_bytes = 0;
   // Entirely empty regions that trim/compact can release, including headers.
   // This overlaps allocator_metadata_bytes and unused_bytes; do not add it.

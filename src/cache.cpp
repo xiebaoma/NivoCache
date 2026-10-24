@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <list>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 namespace nivo {
@@ -140,11 +143,21 @@ struct Cache::Impl {
     Counters counters;
     Pool(PoolId id_, PoolConfig config_)
         : id(id_), config(std::move(config_)),
-          budget(std::make_shared<detail::MemoryAllocator>(config.capacity_bytes)) {}
+          budget(std::make_shared<detail::MemoryAllocator>(config.capacity_bytes)) {
+      budget->reserve_initial(config.initial_reserve_bytes, config.initial_reserve_timeout);
+    }
   };
   using PoolMap = std::map<PoolId, Pool>;
   explicit Impl(CacheConfig config_) : config(std::move(config_)) {
     if (!config.clock) config.clock = std::make_shared<SteadyClock>();
+  }
+  ~Impl() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      closed = true;
+    }
+    reserve_wakeup.notify_all();
+    if (reserve_worker.joinable()) reserve_worker.join();
   }
   CacheConfig config;
   std::shared_ptr<const detail::Owner> owner = std::make_shared<detail::Owner>();
@@ -154,6 +167,22 @@ struct Cache::Impl {
   PoolId last_pool = 0;
   Version last_version = 0;
   bool closed = false;
+  std::condition_variable reserve_wakeup;
+  std::thread reserve_worker;
+
+  void maintain_reserves() {
+    std::unique_lock<std::mutex> lock(mutex);
+    while (!closed) {
+      std::optional<detail::MemoryAllocator::TimePoint> next;
+      for (PoolMap::value_type& pool_entry : pools) {
+        const std::optional<detail::MemoryAllocator::TimePoint> deadline =
+            pool_entry.second.budget->maintain_initial_reserve();
+        if (deadline && (!next || *deadline < *next)) next = deadline;
+      }
+      if (next) reserve_wakeup.wait_until(lock, *next);
+      else reserve_wakeup.wait(lock);
+    }
+  }
 
   bool valid_key(std::string_view key) const {
     return !key.empty() && key.size() <= config.max_key_bytes;
@@ -278,9 +307,11 @@ Result<std::unique_ptr<Cache>> Cache::create(CacheConfig config) {
   return std::unique_ptr<Cache>(new Cache(std::make_unique<Impl>(std::move(config))));
 }
 Result<PoolId> Cache::add_pool(PoolConfig config) {
-  std::lock_guard lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   if (impl_->closed) return Status::closed;
   if (config.name.empty() || config.capacity_bytes == 0) return Status::invalid_argument;
+  if (config.initial_reserve_bytes > config.capacity_bytes || config.initial_reserve_timeout.count() <= 0)
+    return Status::invalid_argument;
   if (config.eviction != EvictionPolicy::lru && config.eviction != EvictionPolicy::fifo)
     return Status::invalid_argument;
   for (const Impl::PoolMap::value_type& pool_entry : impl_->pools) {
@@ -291,9 +322,27 @@ Result<PoolId> Cache::add_pool(PoolConfig config) {
       impl_->last_pool == std::numeric_limits<PoolId>::max()) return Status::resource_exhausted;
   const PoolId id = impl_->last_pool + 1;
   const std::size_t capacity = config.capacity_bytes;
-  impl_->pools.try_emplace(id, id, std::move(config));
+  const bool reserve = config.initial_reserve_bytes != 0;
+  try {
+    impl_->pools.try_emplace(id, id, std::move(config));
+    if (reserve && !impl_->reserve_worker.joinable()) {
+      try {
+        impl_->reserve_worker = std::thread([state = impl_.get()] { state->maintain_reserves(); });
+      } catch (...) {
+        impl_->pools.erase(id);
+        throw;
+      }
+    }
+  } catch (const std::invalid_argument&) {
+    return Status::invalid_argument;
+  } catch (const std::bad_alloc&) {
+    return Status::resource_exhausted;
+  } catch (const std::system_error&) {
+    return Status::resource_exhausted;
+  }
   impl_->last_pool = id;
   impl_->assigned += capacity;
+  if (reserve) impl_->reserve_wakeup.notify_one();
   return id;
 }
 Status Cache::resize_pool(PoolId pool, std::size_t capacity_bytes) {
@@ -546,8 +595,9 @@ Result<CompactionStats> Cache::compact() {
   }
 }
 void Cache::close() {
-  std::lock_guard lock(impl_->mutex);
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->closed = true;
+  impl_->reserve_wakeup.notify_all();
   for (Impl::PoolMap::value_type& pool_entry : impl_->pools) {
     Impl::Pool& p = pool_entry.second;
     p.budget->trim(true);

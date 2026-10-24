@@ -24,6 +24,8 @@ class Cache final {
   Cache& operator=(Cache&&) = delete;
 
   [[nodiscard]] static constexpr Capabilities capabilities() noexcept { return {}; }
+  // Optional startup storage is prepared before success; preparation failure
+  // returns resource_exhausted without adding the pool or charging its quota.
   [[nodiscard]] Result<PoolId> add_pool(PoolConfig config);
   // Shrinking may evict. On failure the old capacity remains; evictions remain.
   [[nodiscard]] Status resize_pool(PoolId pool, std::size_t capacity_bytes);
@@ -54,7 +56,7 @@ class Cache final {
   [[nodiscard]] Status erase(PoolId pool, std::string_view key,
                               Version expected_version = invalid_version);
   [[nodiscard]] Status clear(PoolId pool);
-  // Explicit expiry maintenance; no background threads in the reference engine.
+  // Item expiry is explicit; the optional startup-reserve worker only frees storage.
   [[nodiscard]] Result<std::size_t> prune_expired(PoolId pool);
   // Synchronously compact one pool or all pools under the cache lock. Prunes
   // entries expired at the start of the call; preserves versions, TTL and
@@ -65,6 +67,7 @@ class Cache final {
   // Uses temporary storage for planning and copies; never evicts live entries
   // or charges copies against the logical quota. Allocation failure returns
   // resource_exhausted; completed moves and expiry cleanup remain valid.
+  // Released regions are unmapped from the process. Pinned regions remain mapped.
   // Reports allocator-owned bytes, not RSS. No background compaction runs.
   [[nodiscard]] Result<CompactionStats> compact(PoolId pool);
   [[nodiscard]] Result<CompactionStats> compact();

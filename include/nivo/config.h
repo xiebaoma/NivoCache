@@ -36,6 +36,16 @@ struct PoolConfig {
   std::string name;
   std::size_t capacity_bytes = 0;
   EvictionPolicy eviction = EvictionPolicy::lru;
+  // Zero disables startup reservation. Otherwise add_pool() synchronously
+  // reserves and write-touches slab mappings, rounded up to whole slabs plus
+  // region headers and OS page rounding. Must not exceed capacity_bytes. Direct large allocations
+  // bypass this reserve. This is resident-page preparation, not memory locking.
+  std::size_t initial_reserve_bytes = 0;
+  // Positive elapsed-time retention from completion of preparation, independent
+  // of CacheConfig::clock. Unused regions revert to normal retention at expiry,
+  // even without requests. Trim/clear, resize, compact and close may release
+  // them earlier. Startup storage is never replenished automatically.
+  Duration initial_reserve_timeout{30000};
 };
 
 enum class WriteMode { upsert, insert_only, replace_only, compare_exchange };
