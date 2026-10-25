@@ -36,7 +36,7 @@ class Cache final {
   // trim regions or change eviction order. O(number of pools), not items.
   // Each pool's storage breakdown is consistent under concurrent handle release;
   // pools are sampled sequentially. Only the global overload samples process RSS
-  // (macOS/Linux; unavailable on other platforms or if the OS query fails).
+  // (Windows/macOS/Linux; unavailable on other platforms or if the OS query fails).
   [[nodiscard]] CacheMemoryStats memory_stats() const;
   [[nodiscard]] Result<MemoryStats> memory_stats(PoolId pool) const;
 

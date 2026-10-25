@@ -28,6 +28,9 @@ target_include_directories(nivo_cache PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(nivo_cache PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(nivo_cache PRIVATE psapi)
+endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(nivo_cache PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()

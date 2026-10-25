@@ -6,7 +6,16 @@
 #include <optional>
 #include <string_view>
 
-#if defined(__APPLE__) && defined(__MACH__)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__APPLE__) && defined(__MACH__)
 #include <mach/mach.h>
 #elif defined(__linux__)
 #include <cstdio>
@@ -37,7 +46,12 @@ inline std::optional<std::size_t> rss_from_statm(std::string_view input, long pa
 }
 
 inline std::optional<std::size_t> process_rss_bytes() noexcept {
-#if defined(__APPLE__) && defined(__MACH__)
+#if defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  if (GetProcessMemoryInfo(GetCurrentProcess(), &counters,
+          static_cast<DWORD>(sizeof(counters))) == 0) return std::nullopt;
+  return static_cast<std::size_t>(counters.WorkingSetSize);
+#elif defined(__APPLE__) && defined(__MACH__)
   mach_task_basic_info_data_t info{};
   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
   const kern_return_t status = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,

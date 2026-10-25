@@ -435,7 +435,11 @@ void page_memory_mapping_contract() {
   Pages::unmap(memory, 2 * page);
   // Inspect the address without dereferencing it. This distinguishes actual
   // unmapping from merely putting storage on an allocator free list.
-#if defined(__APPLE__)
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION info{};
+  const SIZE_T result = VirtualQuery(memory, &info, sizeof(info));
+  CHECK(result == sizeof(info) && info.State == MEM_FREE);
+#elif defined(__APPLE__)
   mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(memory);
   mach_vm_size_t region_size = 0;
   vm_region_basic_info_data_64_t info{};
@@ -1450,7 +1454,7 @@ void memory_monitor_empty_and_process_rss() {
   CHECK(sample.pools.size() == 1 && sample.pools[0].id == f.pool && sample.pools[0].name == "default");
   CHECK(f.cache->memory_stats(f.pool).value().reserved_bytes == 0);
   CHECK(f.cache->memory_stats(999).status() == Status::pool_not_found);
-#if (defined(__APPLE__) && defined(__MACH__)) || defined(__linux__)
+#if defined(_WIN32) || (defined(__APPLE__) && defined(__MACH__)) || defined(__linux__)
   CHECK(sample.process_rss_bytes.has_value() && *sample.process_rss_bytes > 0);
 #else
   CHECK(!sample.process_rss_bytes.has_value());
