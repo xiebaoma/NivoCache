@@ -11,6 +11,8 @@
 #include <functional>
 #include <future>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -1092,6 +1094,37 @@ void verify_sparse(nivo::Cache& cache, nivo::PoolId pool) {
     CHECK(text(found.value()) == compact_value(i));
   }
 }
+bool value_aligned(const nivo::ReadHandle& handle) {
+  const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(handle.bytes().data());
+  return address % alignof(std::max_align_t) == 0;
+}
+void value_storage_alignment() {
+  Fixture f(1024 * 1024);
+  for (std::size_t length = 1; length <= 40; ++length) {
+    const std::string key(length, static_cast<char>('a' + length % 26));
+    const std::string value(length * 3 + 1, 'v');
+    const nivo::Result<nivo::ReadHandle> published = f.cache->put(f.pool, key, bytes(value));
+    CHECK(published && value_aligned(published.value()));
+    nivo::Result<nivo::WriteHandle> draft = f.cache->allocate(f.pool, key + "#", length);
+    CHECK(draft);
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(draft.value().bytes().data());
+    CHECK(address % alignof(std::max_align_t) == 0);
+  }
+  for (std::size_t length = 1; length <= 40; ++length) {
+    const std::string key(length, static_cast<char>('a' + length % 26));
+    const nivo::Result<nivo::ReadHandle> found = f.cache->find(f.pool, key);
+    CHECK(found && found.value().key() == key && value_aligned(found.value()));
+    CHECK(text(found.value()) == std::string(length * 3 + 1, 'v'));
+  }
+  // Compaction copies entries into new storage and must keep the guarantee.
+  Fixture sparse(16 * 1024 * 1024);
+  populate_sparse(*sparse.cache, sparse.pool);
+  CHECK(sparse.cache->compact(sparse.pool).value().moved_items > 0);
+  verify_sparse(*sparse.cache, sparse.pool);
+  for (std::size_t i = 0; i < 512; i += 32)
+    CHECK(value_aligned(sparse.cache->peek(sparse.pool, compact_key(i)).value()));
+}
+
 void compaction_reclaims_sparse_regions() {
   Fixture f(16 * 1024 * 1024);
   populate_sparse(*f.cache, f.pool);
@@ -2407,7 +2440,8 @@ int main() {
     {"initial_reserve_background_live_data_and_lifetime", initial_reserve_background_live_data_and_lifetime},
     {"initial_reserve_concurrent_expiry_and_compaction", initial_reserve_concurrent_expiry_and_compaction},
     {"initial_reserve_pages_are_resident", initial_reserve_pages_are_resident},
-    {"allocator_compaction_skips_marginal_savings", allocator_compaction_skips_marginal_savings}
+    {"allocator_compaction_skips_marginal_savings", allocator_compaction_skips_marginal_savings},
+    {"value_storage_alignment", value_storage_alignment}
   };
   unsigned failures = 0;
   for (const std::pair<const char*, std::function<void()>>& test_case : cases) {

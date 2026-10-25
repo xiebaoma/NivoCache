@@ -236,8 +236,8 @@ class CachePool final {
           destination->pool = source.pool;
           destination->version = source.version;
           destination->expires_at = source.expires_at;
-          char* key = reinterpret_cast<char*>(&*destination + 1);
-          std::byte* value = reinterpret_cast<std::byte*>(key + source.key.size());
+          std::byte* value = entry_value_data(*destination);
+          char* key = reinterpret_cast<char*>(value + source.value.size());
           std::memcpy(key, source.key.data(), source.key.size());
           if (!source.value.empty()) std::memcpy(value, source.value.data(), source.value.size());
           destination->key = {key, source.key.size()};
@@ -285,10 +285,10 @@ class CachePool final {
     entry->allocation = allocation;
     entry->pool = id_;
     entry->charge = charge;
-    char* key_data = reinterpret_cast<char*>(&*entry + 1);
+    std::byte* value = entry_value_data(*entry);
+    char* key_data = reinterpret_cast<char*>(value + value_size);
     std::memcpy(key_data, key.data(), key.size());
     entry->key = {key_data, key.size()};
-    std::byte* value = reinterpret_cast<std::byte*>(key_data + key.size());
     entry->value = {value, value_size};
     std::fill(entry->value.begin(), entry->value.end(), std::byte{0});
     counters_.allocations.fetch_add(1, std::memory_order_relaxed);
