@@ -119,13 +119,14 @@ void accumulate(MemoryStats& a, const MemoryStats& b) {
 
 struct Cache::Impl {
   using PoolMap = std::map<PoolId, std::unique_ptr<detail::CachePool>>;
+  using SteadyTime = std::chrono::steady_clock::time_point;
   explicit Impl(CacheConfig config_) : config(std::move(config_)) {
     if (!config.clock) config.clock = std::make_shared<SteadyClock>();
   }
   ~Impl() {
     closed.store(true, std::memory_order_release);
-    wake_reserves();
-    if (reserve_worker.joinable()) reserve_worker.join();
+    wake_worker();
+    if (worker.joinable()) worker.join();
   }
   CacheConfig config;
   std::shared_ptr<const detail::Owner> owner = std::make_shared<detail::Owner>();
@@ -137,34 +138,131 @@ struct Cache::Impl {
   std::size_t assigned = 0;
   PoolId last_pool = 0;
   std::atomic<bool> closed{false};
-  std::mutex reserve_mutex;
-  std::condition_variable reserve_wakeup;
-  std::thread reserve_worker;
+  // One background thread serves startup reserves and TTL reaping. It never
+  // holds worker_mutex while working, so wakeups and close() do not wait.
+  std::mutex worker_mutex;
+  std::condition_variable worker_wakeup;
+  bool worker_signaled = false;
+  std::thread worker;
+  struct {
+    std::atomic<std::uint64_t> passes{0}, reclaimed{0}, throttles{0}, compactions{0};
+    std::atomic<Duration::rep> last_pass{0}, max_pass{0};
+  } reaper_stats;
 
-  void wake_reserves() {
-    std::lock_guard<std::mutex> lock(reserve_mutex);
-    reserve_wakeup.notify_all();
+  bool reaping() const noexcept { return config.reaper.interval.count() > 0; }
+  void wake_worker() {
+    std::lock_guard<std::mutex> lock(worker_mutex);
+    worker_signaled = true;
+    worker_wakeup.notify_all();
   }
-  void maintain_reserves() {
-    std::unique_lock<std::mutex> lock(reserve_mutex);
-    while (!closed.load(std::memory_order_acquire)) {
-      std::optional<detail::MemoryAllocator::TimePoint> next;
-      PoolId previous = invalid_pool;
-      for (;;) {
-        detail::CachePool* pool;
-        {
-          std::shared_lock<detail::SharedMutex> registry_lock(registry_mutex);
-          PoolMap::const_iterator entry = pools.upper_bound(previous);
-          if (entry == pools.end()) break;
-          previous = entry->first;
-          pool = entry->second.get();
-        }
-        const std::optional<detail::MemoryAllocator::TimePoint> deadline = pool->maintain_reserve();
-        if (deadline && (!next || *deadline < *next)) next = deadline;
+  // Visits pools in id order without holding the registry lock during work.
+  template <typename Function>
+  void for_each_pool(Function&& function) {
+    PoolId previous = invalid_pool;
+    for (;;) {
+      detail::CachePool* pool;
+      {
+        std::shared_lock<detail::SharedMutex> registry_lock(registry_mutex);
+        PoolMap::const_iterator entry = pools.upper_bound(previous);
+        if (entry == pools.end()) return;
+        previous = entry->first;
+        pool = entry->second.get();
       }
-      if (next) reserve_wakeup.wait_until(lock, *next);
-      else reserve_wakeup.wait(lock);
+      if (!function(*pool)) return;
     }
+  }
+  void run_worker() {
+    SteadyTime next_reap = std::chrono::steady_clock::now() + config.reaper.interval;
+    std::unique_lock<std::mutex> lock(worker_mutex);
+    while (!closed.load(std::memory_order_acquire)) {
+      worker_signaled = false;
+      lock.unlock();
+      std::optional<SteadyTime> next;
+      for_each_pool([&](detail::CachePool& pool) {
+        const std::optional<detail::MemoryAllocator::TimePoint> deadline = pool.maintain_reserve();
+        if (deadline && (!next || *deadline < *next)) next = deadline;
+        return true;
+      });
+      if (reaping()) {
+        if (std::chrono::steady_clock::now() >= next_reap) {
+          reap_pass();
+          next_reap = std::chrono::steady_clock::now() + config.reaper.interval;
+        }
+        if (!next || next_reap < *next) next = next_reap;
+      }
+      lock.lock();
+      if (next) worker_wakeup.wait_until(lock, *next, [this] { return worker_ready(); });
+      else worker_wakeup.wait(lock, [this] { return worker_ready(); });
+    }
+  }
+  bool worker_ready() const noexcept {
+    return worker_signaled || closed.load(std::memory_order_acquire);
+  }
+  // Runs between reaping batches with no cache locks held. Enforces the
+  // work/sleep duty cycle and stops the pass on close().
+  class Throttle final {
+   public:
+    explicit Throttle(Impl& impl) : impl_(impl), slice_(std::chrono::steady_clock::now()) {}
+    bool stopped() const noexcept { return stopped_ || impl_.closed.load(std::memory_order_acquire); }
+    bool operator()() {
+      if (stopped()) return false;
+      const ReaperConfig& reaper = impl_.config.reaper;
+      if (reaper.sleep_slice.count() == 0) return true;
+      if (std::chrono::steady_clock::now() - slice_ < reaper.work_slice) return true;
+      impl_.reaper_stats.throttles.fetch_add(1, std::memory_order_relaxed);
+      {
+        std::unique_lock<std::mutex> lock(impl_.worker_mutex);
+        stopped_ = impl_.worker_wakeup.wait_for(lock, reaper.sleep_slice, [this] {
+          return impl_.closed.load(std::memory_order_acquire);
+        });
+      }
+      slice_ = std::chrono::steady_clock::now();
+      return !stopped_;
+    }
+   private:
+    Impl& impl_;
+    SteadyTime slice_;
+    bool stopped_ = false;
+  };
+  // Checks fragmentation only after reaping freed slots in this pool. A
+  // pending check survives the cooldown, so a later pass still performs it.
+  void maybe_compact(detail::CachePool& pool) {
+    const ReaperConfig& reaper = config.reaper;
+    detail::CachePool::AutoCompaction& state = pool.auto_compaction();
+    if (reaper.compact_unused_percent == 0 || !state.pending) return;
+    const SteadyTime now = std::chrono::steady_clock::now();
+    if (state.ran && now - state.last < reaper.compact_cooldown) return;
+    state.pending = false;
+    const detail::CachePool::StorageUse use = pool.storage_use();
+    if (use.unused < reaper.compact_min_unused_bytes ||
+        use.unused / reaper.compact_unused_percent < use.reserved / 100) return;
+    state.ran = true;
+    state.last = now;
+    if (pool.compact(pool.now())) reaper_stats.compactions.fetch_add(1, std::memory_order_relaxed);
+  }
+  // One throttled sweep of every pool. Each pool uses a fresh clock reading.
+  void reap_pass() {
+    const SteadyTime begin = std::chrono::steady_clock::now();
+    Throttle throttle(*this);
+    for_each_pool([&](detail::CachePool& pool) {
+      Result<std::size_t> reaped = pool.reap(pool.now(), std::numeric_limits<std::size_t>::max(),
+                                             config.reaper.batch_size, throttle);
+      if (reaped) {
+        reaper_stats.reclaimed.fetch_add(reaped.value(), std::memory_order_relaxed);
+        if (reaped.value() != 0) pool.auto_compaction().pending = true;
+      }
+      if (throttle.stopped()) return false;
+      maybe_compact(pool);
+      // Lets spare slabs left by reaping decay back to the OS while idle.
+      pool.maintain_storage();
+      return !throttle.stopped();
+    });
+    const Duration elapsed =
+        std::chrono::duration_cast<Duration>(std::chrono::steady_clock::now() - begin);
+    reaper_stats.passes.fetch_add(1, std::memory_order_relaxed);
+    reaper_stats.last_pass.store(elapsed.count(), std::memory_order_relaxed);
+    if (elapsed.count() > reaper_stats.max_pass.load(std::memory_order_relaxed))
+      reaper_stats.max_pass.store(elapsed.count(), std::memory_order_relaxed);
   }
   bool valid_key(std::string_view key) const {
     return !key.empty() && key.size() <= config.max_key_bytes;
@@ -185,6 +283,10 @@ Result<std::unique_ptr<Cache>> Cache::create(CacheConfig config) {
     return Status::invalid_argument;
   if (config.storage == StorageMode::hybrid) return Status::unsupported;
   if (config.storage != StorageMode::memory) return Status::invalid_argument;
+  const ReaperConfig& reaper = config.reaper;
+  if (reaper.interval.count() < 0 || reaper.batch_size == 0 || reaper.work_slice.count() < 0 ||
+      reaper.sleep_slice.count() < 0 || reaper.compact_unused_percent > 100 ||
+      reaper.compact_cooldown.count() < 0) return Status::invalid_argument;
   return std::unique_ptr<Cache>(new Cache(std::make_unique<Impl>(std::move(config))));
 }
 Result<PoolId> Cache::add_pool(PoolConfig config) {
@@ -205,15 +307,16 @@ Result<PoolId> Cache::add_pool(PoolConfig config) {
   const PoolId id = impl_->last_pool + 1;
   const std::size_t capacity = config.capacity_bytes;
   const bool reserve = config.initial_reserve_bytes != 0;
+  const bool needs_worker = reserve || impl_->reaping();
   try {
     std::unique_ptr<detail::CachePool> pool = std::make_unique<detail::CachePool>(
         id, std::move(config), impl_->owner, impl_->config.clock);
     {
       std::unique_lock<detail::SharedMutex> lock(impl_->registry_mutex);
       impl_->pools.emplace(id, std::move(pool));
-      if (reserve && !impl_->reserve_worker.joinable()) {
+      if (needs_worker && !impl_->worker.joinable()) {
         try {
-          impl_->reserve_worker = std::thread([state = impl_.get()] { state->maintain_reserves(); });
+          impl_->worker = std::thread([state = impl_.get()] { state->run_worker(); });
         } catch (...) {
           impl_->pools.erase(id);
           throw;
@@ -229,7 +332,7 @@ Result<PoolId> Cache::add_pool(PoolConfig config) {
   } catch (const std::system_error&) {
     return Status::resource_exhausted;
   }
-  if (reserve) impl_->wake_reserves();
+  if (reserve) impl_->wake_worker();
   return id;
 }
 Status Cache::resize_pool(PoolId pool, std::size_t capacity_bytes) {
@@ -266,11 +369,18 @@ CacheStats Cache::stats() const {
   result.assigned_bytes = impl_->assigned;
   result.pools = impl_->pools.size();
   result.closed = impl_->closed.load(std::memory_order_acquire);
+  result.reaper.passes = impl_->reaper_stats.passes.load(std::memory_order_relaxed);
+  result.reaper.reclaimed = impl_->reaper_stats.reclaimed.load(std::memory_order_relaxed);
+  result.reaper.throttles = impl_->reaper_stats.throttles.load(std::memory_order_relaxed);
+  result.reaper.compactions = impl_->reaper_stats.compactions.load(std::memory_order_relaxed);
+  result.reaper.last_pass = Duration(impl_->reaper_stats.last_pass.load(std::memory_order_relaxed));
+  result.reaper.max_pass = Duration(impl_->reaper_stats.max_pass.load(std::memory_order_relaxed));
   for (const Impl::PoolMap::value_type& entry : impl_->pools) {
     const PoolStats pool = entry.second->snapshot();
     result.allocated_bytes += pool.allocated_bytes;
     result.indexed_bytes += pool.indexed_bytes;
     result.indexed_items += pool.indexed_items;
+    result.ttl_items += pool.ttl_items;
     accumulate(result.counters, pool.counters);
     accumulate(result.allocator, pool.allocator);
   }
@@ -346,10 +456,30 @@ Status Cache::clear(PoolId pool) {
   if (!found) return found.status();
   return found.value()->clear();
 }
-Result<std::size_t> Cache::prune_expired(PoolId pool) {
+Result<std::size_t> Cache::prune_expired(PoolId pool, std::size_t max_items) {
   Result<detail::CachePool*> found = impl_->get_pool(pool);
   if (!found) return found.status();
-  return found.value()->prune();
+  detail::CachePool& target = *found.value();
+  return target.reap(target.now(), max_items, impl_->config.reaper.batch_size, [] { return true; });
+}
+Result<std::size_t> Cache::prune_expired() {
+  if (impl_->closed.load(std::memory_order_acquire)) return Status::closed;
+  const Duration now = impl_->config.clock->now();
+  std::size_t total = 0;
+  Status status = Status::ok;
+  impl_->for_each_pool([&](detail::CachePool& pool) {
+    Result<std::size_t> reaped =
+        pool.reap(now, std::numeric_limits<std::size_t>::max(), impl_->config.reaper.batch_size,
+                  [] { return true; });
+    if (!reaped) {
+      status = reaped.status();
+      return false;
+    }
+    total += reaped.value();
+    return true;
+  });
+  if (status != Status::ok) return status;
+  return total;
 }
 Result<CompactionStats> Cache::compact(PoolId pool) {
   Result<detail::CachePool*> found = impl_->get_pool(pool);
@@ -388,6 +518,6 @@ void Cache::close() {
   // Control serialization prevents adding/removing pools. No registry lock is
   // needed while waiting for in-flight operations in each pool to finish.
   for (const Impl::PoolMap::value_type& entry : impl_->pools) entry.second->close();
-  impl_->wake_reserves();
+  impl_->wake_worker();
 }
 }  // namespace nivo

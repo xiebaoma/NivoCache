@@ -1,6 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <shared_mutex>
 
 #include "cache_index.h"
@@ -25,6 +28,8 @@ struct AtomicCounters {
 // outside index/policy locks. Exclusive maintenance prevents new references and
 // allocations during compaction, quota pressure, clear, resize and snapshots.
 // Ordinary operations share the guard and synchronize only within each module.
+// Expiry reaping is an ordinary operation: it holds the shared guard and one
+// index stripe at a time, for a bounded batch, and never scans the whole pool.
 class CachePool final {
  public:
   CachePool(PoolId id, PoolConfig config, std::shared_ptr<const Owner> owner,
@@ -43,6 +48,7 @@ class CachePool final {
   std::optional<MemoryAllocator::TimePoint> maintain_reserve() {
     return budget_->maintain_initial_reserve();
   }
+  void maintain_storage() noexcept { budget_->maintain(); }
 
   Result<EntryPtr> allocate(std::string_view key, std::size_t value_size) {
     std::shared_lock<SharedMutex> lock(maintenance_);
@@ -76,6 +82,7 @@ class CachePool final {
     EntryPtr retired;
     EntryPtr expired_entry;
     const Status status = index_.write(draft->key, [&](CacheIndex::Slot& slot) -> Status {
+      if (options.ttl.count() != 0 && !slot.prepare_expiry(now)) return Status::resource_exhausted;
       if (slot.get() && expired(*slot.get(), now)) {
         eviction_.remove(*slot.get());
         expired_entry = slot.remove();
@@ -90,7 +97,7 @@ class CachePool final {
       const Version version = owner_->next_version();
       if (version == invalid_version) return Status::resource_exhausted;
       draft->version = version;
-      draft->expires_at = options.ttl.count() == 0 ? std::nullopt : std::optional<Duration>(now + options.ttl);
+      draft->expires_at = options.ttl.count() == 0 ? never_expires : now + options.ttl;
       if (old) eviction_.remove(*old);
       eviction_.insert(*draft);
       retired = slot.replace(*draft);
@@ -174,17 +181,64 @@ class CachePool final {
     budget_->trim(true);
     clear_locked();
   }
-  Result<std::size_t> prune() {
-    std::unique_lock<SharedMutex> lock(maintenance_);
-    if (closed_) return Status::closed;
-    return prune_locked(clock_->now());
+  PoolId id() const noexcept { return id_; }
+  Duration now() const noexcept { return clock_->now(); }
+  struct StorageUse {
+    std::size_t reserved = 0;
+    std::size_t unused = 0;  // as MemoryStats::unused_bytes
+  };
+  // Takes only the allocator lock, never the maintenance guard.
+  StorageUse storage_use() const {
+    const AllocatorStats storage = budget_->inspect();
+    return {storage.reserved_bytes,
+            storage.reserved_bytes - storage.metadata_bytes - storage.active_bytes};
+  }
+  // Background compaction bookkeeping, used only by the cache worker thread.
+  struct AutoCompaction {
+    bool pending = false;  // entries were reaped since the last check
+    bool ran = false;
+    std::chrono::steady_clock::time_point last{};
+  };
+  AutoCompaction& auto_compaction() noexcept { return auto_compaction_; }
+  // Reclaims up to limit entries expired at now, examining at most batch due
+  // entries per stripe lock hold. Each batch takes the shared guard only, so
+  // reads and writes continue; resume() runs between batches with no locks
+  // held and may stop early by returning false. A rotating start stripe keeps
+  // bounded calls fair. Cost follows the number of due entries, not pool size.
+  template <typename Resume>
+  Result<std::size_t> reap(Duration now, std::size_t limit, std::size_t batch, Resume&& resume) {
+    std::size_t count = 0;
+    const std::size_t start = reap_cursor_.load(std::memory_order_relaxed);
+    for (std::size_t offset = 0; offset < CacheIndex::stripe_count; ++offset) {
+      const std::size_t stripe = (start + offset) % CacheIndex::stripe_count;
+      for (;;) {
+        if (count >= limit) {
+          reap_cursor_.store(stripe, std::memory_order_relaxed);
+          return count;
+        }
+        Reaped step;
+        {
+          std::shared_lock<SharedMutex> lock(maintenance_);
+          if (closed_) return Status::closed;
+          step = reap_stripe(stripe, now, std::min(batch, limit - count));
+        }
+        count += step.count;
+        if (step.examined && !resume()) {
+          reap_cursor_.store(step.more ? stripe : (stripe + 1) % CacheIndex::stripe_count,
+                             std::memory_order_relaxed);
+          return count;
+        }
+        if (!step.more) break;
+      }
+    }
+    return count;
   }
 
   PoolStats snapshot() const {
     std::unique_lock<SharedMutex> lock(maintenance_);
     const CacheIndex::Stats index = index_.stats();
     return {id_, config_.name, config_.capacity_bytes, budget_->used.load(std::memory_order_relaxed),
-            index.bytes, index.items, counters_.snapshot(), budget_->stats()};
+            index.bytes, index.items, index.expiring, counters_.snapshot(), budget_->stats()};
   }
   MemoryStats memory_snapshot() const {
     std::unique_lock<SharedMutex> lock(maintenance_);
@@ -301,12 +355,37 @@ class CachePool final {
       retired = slot.remove();
     });
   }
+  struct Reaped {
+    std::size_t count = 0;
+    bool examined = false;
+    bool more = false;
+  };
+  // Requires the maintenance guard in either mode. The policy queue is locked
+  // once per batch, after the stripe lock is released; the detached entries
+  // are unreachable through the index, so nothing else touches their links.
+  Reaped reap_stripe(std::size_t stripe, Duration now, std::size_t limit) {
+    CacheIndex::Expired expired = index_.expire(stripe, now, limit);
+    if (expired.chain) {
+      eviction_.remove_chain(expired.chain);
+      counters_.expirations.fetch_add(expired.count, std::memory_order_relaxed);
+      while (expired.chain) {
+        Entry* next = expired.chain->hash_next;
+        expired.chain->hash_next = nullptr;
+        EntryPtr released(expired.chain);
+        expired.chain = next;
+      }
+    }
+    return {expired.count, expired.examined != 0, expired.more};
+  }
   std::size_t prune_locked(Duration now) {
     std::size_t count = 0;
-    for (Entry* entry : eviction_.entries()) {
-      if (expired(*entry, now)) { unlink(*entry); ++count; }
+    for (std::size_t stripe = 0; stripe < CacheIndex::stripe_count; ++stripe) {
+      for (;;) {
+        const Reaped step = reap_stripe(stripe, now, locked_reap_batch);
+        count += step.count;
+        if (!step.more) break;
+      }
     }
-    counters_.expirations.fetch_add(count, std::memory_order_relaxed);
     return count;
   }
   bool make_room(std::size_t target, std::string_view protected_key) {
@@ -325,6 +404,9 @@ class CachePool final {
     index_.clear();
   }
 
+  // Exclusive callers already block all traffic, so larger batches are fine.
+  static constexpr std::size_t locked_reap_batch = 1024;
+
   const PoolId id_;
   PoolConfig config_;
   const std::shared_ptr<const Owner> owner_;
@@ -335,5 +417,7 @@ class CachePool final {
   CacheIndex index_;
   EvictionQueue eviction_;
   AtomicCounters counters_;
+  std::atomic<std::size_t> reap_cursor_{0};
+  AutoCompaction auto_compaction_;
 };
 }  // namespace nivo::detail

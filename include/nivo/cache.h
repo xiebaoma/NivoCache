@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -56,8 +58,17 @@ class Cache final {
   [[nodiscard]] Status erase(PoolId pool, std::string_view key,
                               Version expected_version = invalid_version);
   [[nodiscard]] Status clear(PoolId pool);
-  // Item expiry is explicit; the optional startup-reserve worker only frees storage.
-  [[nodiscard]] Result<std::size_t> prune_expired(PoolId pool);
+  // Expired entries are hidden immediately and reclaimed lazily when touched,
+  // by the background reaper (CacheConfig::reaper), or by these calls.
+  // Reclaims up to max_items entries already expired when the call starts and
+  // returns how many. Never takes the exclusive pool guard: work proceeds in
+  // ReaperConfig::batch_size steps per index stripe, so concurrent reads and
+  // writes continue. Cost is proportional to expired entries, not pool size.
+  // Successive bounded calls rotate across stripes, allowing incremental cleanup.
+  [[nodiscard]] Result<std::size_t> prune_expired(
+      PoolId pool, std::size_t max_items = std::numeric_limits<std::size_t>::max());
+  // All pools, sharing one expiry cutoff.
+  [[nodiscard]] Result<std::size_t> prune_expired();
   // Synchronously compact one pool or all pools under per-pool maintenance guards. Prunes
   // entries expired at the start of the call; preserves versions, TTL and
   // eviction order. Pins, unpublished drafts and direct large allocations are
@@ -68,7 +79,8 @@ class Cache final {
   // or charges copies against the logical quota. Allocation failure returns
   // resource_exhausted; completed moves and expiry cleanup remain valid.
   // Released regions are unmapped from the process. Pinned regions remain mapped.
-  // Reports allocator-owned bytes, not RSS. No background compaction runs.
+  // Reports allocator-owned bytes, not RSS. Background compaction runs only if
+  // ReaperConfig::compact_unused_percent enables it.
   [[nodiscard]] Result<CompactionStats> compact(PoolId pool);
   [[nodiscard]] Result<CompactionStats> compact();
   // Idempotent; unlinks everything, rejects future data/control operations.

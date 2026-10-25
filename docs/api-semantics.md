@@ -38,7 +38,14 @@ CAS requires a nonzero `expected_version`; other write modes require zero. Succe
 
 - TTL is measured in milliseconds from publication using a monotonic clock. Zero means no expiration; negative TTL is invalid.
 - An entry expires when `now >= publication_time + ttl`. Reads do not extend TTL.
-- Expiration is discovered during operations or through `prune_expired`; there is no background worker.
+- An expired entry is never returned. Its memory is reclaimed in four ways: lazily when an operation touches the key, under allocation pressure, by the background reaper, or by `prune_expired`.
+- The background reaper is configured by `CacheConfig::reaper`. It sleeps for `interval` (default 1 s, measured on the steady clock) between passes; zero disables it. It starts with the first pool. One thread serves all pools and also handles startup reserves.
+- Deadlines are tracked in a timing wheel per index stripe. Reaping costs time proportional to the number of expired entries. Entries without a TTL, or whose deadline has not arrived, are never scanned.
+- Reaping never takes the exclusive pool guard. It holds one index stripe lock at a time for at most `batch_size` entries, so reads and writes proceed concurrently. Background passes follow a `work_slice`/`sleep_slice` duty cycle, so large expiry bursts drain gradually.
+- `prune_expired(pool, max_items)` synchronously reclaims entries already expired when the call starts, up to `max_items`. Repeated bounded calls rotate across stripes, which supports incremental cleanup. `prune_expired()` covers all pools with one cutoff.
+- Item TTLs follow `CacheConfig::clock`, including in the reaper. Custom clocks are therefore also called from the background thread.
+- When every entry in a slab region has been reclaimed, the region is returned to the OS. Each background pass also applies the allocator's time-based spare-slab decay, so an idle cache does not keep spare slabs indefinitely.
+- Reclaiming expired entries that sit next to live entries frees their slots for reuse, but those slabs stay mapped. Background compaction is optional and off by default. When `ReaperConfig::compact_unused_percent` is nonzero, the reaper compacts a pool after it has reclaimed entries from that pool, provided both apply: unused space is at least that percentage of the pool's reserved bytes, and at least `compact_min_unused_bytes`. Each pool is compacted at most once per `compact_cooldown`. Compaction takes the exclusive pool guard, so it briefly blocks reads and writes on that pool; other pools continue. Runs are counted in `CacheStats::reaper.compactions`.
 - `find` updates hit/miss counters and LRU order. `peek` updates neither, but still checks expiration. FIFO reads do not change order.
 - Custom clocks must be thread-safe, nonnegative, nondecreasing, nonthrowing, and must not call back into the cache.
 
@@ -58,6 +65,6 @@ Cache operations are thread-safe; individual lookups, publications, and removals
 
 `Result<T>` carries a value or a `Status`; check it before calling `.value()`. Expected failures include misses, conflicts, invalid arguments, unknown pools, capacity exhaustion, and closure. Standard allocation/system exceptions may still propagate.
 
-Statistics do not trigger expiration cleanup. Indexed counts may include expired entries, and allocated-byte totals are observational snapshots because handles can be released concurrently.
+Statistics do not trigger expiration cleanup. `ttl_items` counts indexed entries that have a TTL; `CacheStats::reaper` reports background passes, reclaimed entries, throttling sleeps and pass durations. Indexed counts may include expired entries, and allocated-byte totals are observational snapshots because handles can be released concurrently.
 
 SSD, persistence, and asynchronous APIs are not implemented; requesting hybrid storage returns `unsupported`. API and ABI compatibility are not guaranteed before 1.0.

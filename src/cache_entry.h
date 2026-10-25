@@ -2,13 +2,17 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
-#include <optional>
 
 #include "memory_allocator.h"
 #include "nivo/handle.h"
 
 namespace nivo::detail {
+// A maximal deadline keeps the read-path expiry test to a single comparison.
+inline constexpr Duration never_expires = Duration::max();
+inline constexpr std::uint16_t expiry_unlinked = std::numeric_limits<std::uint16_t>::max();
+
 struct Owner {
   // Zero is reserved for invalid versions. Never wrap and reuse a version.
   Version next_version() const noexcept {
@@ -33,13 +37,16 @@ struct alignas(std::max_align_t) Entry {
   std::string_view key;
   std::span<std::byte> value;
   PoolId pool = invalid_pool;
+  std::uint16_t expiry_slot = expiry_unlinked;  // fills padding before version
   Version version = invalid_version;
   std::size_t charge = 0;
-  std::optional<Duration> expires_at;
-  // The index and eviction policy own separate intrusive links.
+  Duration expires_at = never_expires;
+  // The index, eviction policy and expiry wheel own separate intrusive links.
   Entry* hash_next = nullptr;
   Entry* policy_previous = nullptr;
   Entry* policy_next = nullptr;
+  Entry* expiry_previous = nullptr;
+  Entry* expiry_next = nullptr;
   std::atomic<std::uint64_t> access_sequence{0};
 };
 
@@ -55,6 +62,6 @@ inline EntryPtr pin_entry(Entry* entry) noexcept {
   return EntryPtr(entry);
 }
 inline bool expired(const Entry& entry, Duration now) noexcept {
-  return entry.expires_at && now >= *entry.expires_at;
+  return now >= entry.expires_at;
 }
 }  // namespace nivo::detail

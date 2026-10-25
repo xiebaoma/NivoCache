@@ -24,12 +24,44 @@ class Clock {
 enum class EvictionPolicy { lru, fifo };
 enum class StorageMode { memory, hybrid };  // hybrid is explicitly unsupported in v0.1
 
+// Background reclamation of expired entries. Expired entries are never
+// returned either way; reaping only frees their memory without waiting for a
+// later access. Each pass costs O(expired entries): TTL deadlines are kept in
+// per-stripe timing wheels, so entries that are not due are never visited.
+struct ReaperConfig {
+  // Delay from the end of one pass to the start of the next, on the steady
+  // clock. Zero disables the background worker; expired entries are then
+  // reclaimed on access, under allocation pressure, or by prune_expired().
+  Duration interval{1000};
+  // Due entries examined per index-stripe lock hold, which bounds how long
+  // any single read or write can wait for the reaper. Must be positive.
+  std::size_t batch_size = 64;
+  // Duty cycle: after work_slice of continuous reaping, sleep for sleep_slice
+  // before continuing, so large expiry bursts drain smoothly over time.
+  // A zero sleep_slice disables throttling.
+  Duration work_slice{5};
+  Duration sleep_slice{10};
+  // Optional background compaction, off by default. Reaping frees slots, but
+  // slabs that still hold live entries stay mapped. After the reaper reclaims
+  // entries from a pool, it compacts that pool when the unused space inside
+  // its mapped storage (MemoryStats::unused_bytes) is at least
+  // compact_unused_percent of its reserved bytes and at least
+  // compact_min_unused_bytes. Compaction takes the exclusive pool guard, so it
+  // briefly blocks that pool's reads and writes; other pools are unaffected.
+  // Each pool is compacted at most once per compact_cooldown. Needs a nonzero
+  // interval, since the background worker performs it.
+  std::uint32_t compact_unused_percent = 0;  // zero disables; at most 100
+  std::size_t compact_min_unused_bytes = 8 * 1024 * 1024;
+  Duration compact_cooldown{60000};
+};
+
 struct CacheConfig {
   std::size_t capacity_bytes = 64 * 1024 * 1024;
   std::size_t max_key_bytes = 1024;
   std::size_t max_value_bytes = 16 * 1024 * 1024;
   StorageMode storage = StorageMode::memory;
-  std::shared_ptr<const Clock> clock;  // null selects steady_clock
+  std::shared_ptr<const Clock> clock;  // null selects steady_clock; also drives TTL reaping
+  ReaperConfig reaper;
 };
 
 struct PoolConfig {

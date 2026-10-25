@@ -345,6 +345,13 @@ class MemoryAllocator final {
     return stats_;
   }
 
+  // Applies the time-based spare decay on schedule, for idle periods in which
+  // no allocation, release or stats() call would otherwise run it.
+  void maintain() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cool(hooks_.now(hooks_.context));
+  }
+
   // Pure observation for monitoring: unlike stats(), do not cool or trim.
   [[nodiscard]] AllocatorStats inspect() const {
     std::lock_guard<std::mutex> lock(mutex_);

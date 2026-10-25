@@ -234,6 +234,8 @@ nivo::TypedCacheConfig small_config(std::size_t capacity, std::shared_ptr<Manual
   nivo::TypedCacheConfig config;
   config.cache.capacity_bytes = capacity;
   config.cache.clock = std::move(clock);
+  // Expiry happens only where a test asks for it.
+  config.cache.reaper.interval = nivo::Duration(0);
   return config;
 }
 

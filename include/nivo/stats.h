@@ -94,8 +94,19 @@ struct PoolStats {
   std::size_t allocated_bytes = 0;  // drafts + indexed entries + detached pinned entries
   std::size_t indexed_bytes = 0;
   std::size_t indexed_items = 0;  // may include expired entries awaiting discovery
+  std::size_t ttl_items = 0;      // indexed entries with a TTL, expired or not
   Counters counters;
   AllocatorStats allocator;
+};
+// Background reaper activity. Counters.expirations counts every expiry,
+// including lazy discovery and prune_expired().
+struct ReaperStats {
+  std::uint64_t passes = 0;      // completed or interrupted background passes
+  std::uint64_t reclaimed = 0;   // expired entries removed by the background reaper
+  std::uint64_t throttles = 0;   // duty-cycle sleeps taken during passes
+  std::uint64_t compactions = 0; // background compactions (ReaperConfig::compact_unused_percent)
+  Duration last_pass{0};         // wall time of the latest pass, including sleeps
+  Duration max_pass{0};
 };
 struct CacheStats {
   std::size_t capacity_bytes = 0;
@@ -103,9 +114,11 @@ struct CacheStats {
   std::size_t allocated_bytes = 0;
   std::size_t indexed_bytes = 0;
   std::size_t indexed_items = 0;
+  std::size_t ttl_items = 0;
   std::size_t pools = 0;
   bool closed = false;
   Counters counters;
   AllocatorStats allocator;
+  ReaperStats reaper;
 };
 }  // namespace nivo

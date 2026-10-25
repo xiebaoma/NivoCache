@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -224,17 +226,108 @@ void run_reserve() {
   const Sample released = sample(*cache, "reserve_expired", 1);
   verify_release(baseline, loaded, released);
 }
+
+std::unique_ptr<nivo::Cache> create_reaping_cache(std::uint32_t compact_unused_percent) {
+  nivo::Result<std::unique_ptr<nivo::Cache>> result = nivo::Cache::create({.capacity_bytes = 256 * mib,
+      .reaper = {.interval = std::chrono::milliseconds{50},
+                 .compact_unused_percent = compact_unused_percent,
+                 .compact_cooldown = std::chrono::milliseconds{0}}});
+  require(result.has_value(), "Cache creation failed");
+  return std::move(result).value();
+}
+
+bool wait_for(const std::function<bool()>& condition) {
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!condition()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  return true;
+}
+
+void put_pattern(nivo::Cache& cache, nivo::PoolId pool, std::size_t i, unsigned round,
+                 std::size_t value_bytes, nivo::Duration ttl) {
+  nivo::Result<nivo::WriteHandle> allocation = cache.allocate(pool, std::to_string(i), value_bytes);
+  require(allocation.has_value(), "Workload allocation failed");
+  nivo::WriteHandle draft = std::move(allocation).value();
+  const std::byte pattern{static_cast<unsigned char>((i + round) % 251 + 1)};
+  std::fill(draft.bytes().begin(), draft.bytes().end(), pattern);
+  require(cache.publish(std::move(draft), {.ttl = ttl}).has_value(), "Workload publication failed");
+}
+
+// Every entry expires; the background reaper alone must unmap all item storage
+// without any erase, clear, prune or compact call.
+void run_ttl() {
+  constexpr std::size_t value_bytes = 8192;
+  constexpr std::size_t count = workload_bytes / value_bytes + 1;
+  std::unique_ptr<nivo::Cache> cache = create_reaping_cache(0);
+  const nivo::PoolId pool = cache->add_pool({.name = "ttl", .capacity_bytes = 256 * mib}).value();
+  const Sample initial = sample(*cache, "initial", 0);
+  for (unsigned round = 1; round <= 3; ++round) {
+    const Sample baseline = sample(*cache, "baseline", round);
+    for (std::size_t i = 0; i < count; ++i)
+      put_pattern(*cache, pool, i, round, value_bytes, std::chrono::milliseconds{300});
+    const Sample loaded = sample(*cache, "loaded", round);
+    require(wait_for([&] { return cache->memory_stats(pool).value().reserved_bytes == 0; }),
+            "Background reaping did not unmap expired storage");
+    require(cache->pool_stats(pool).value().indexed_items == 0, "Expired entries remain indexed");
+    const Sample released = sample(*cache, "reaped", round);
+    verify_release(baseline, loaded, released);
+    require(released.rss <= initial.rss + 16 * mib, "RSS accumulated across workload cycles");
+  }
+  require(cache->stats().reaper.reclaimed == 3 * count, "Reaper did not reclaim every entry");
+}
+
+// Expiring entries interleave with permanent ones, so reaping alone leaves
+// every slab partially live. Background compaction must return the space.
+void run_ttl_compaction() {
+  constexpr std::size_t value_bytes = 4000;
+  constexpr std::size_t count = workload_bytes / value_bytes / 2 * 2;
+  std::unique_ptr<nivo::Cache> cache = create_reaping_cache(30);
+  const nivo::PoolId pool = cache->add_pool({.name = "ttl_compaction", .capacity_bytes = 256 * mib}).value();
+  for (unsigned round = 1; round <= 3; ++round) {
+    const Sample baseline = sample(*cache, "baseline", round);
+    const std::uint64_t compactions = cache->stats().reaper.compactions;
+    for (std::size_t i = 0; i < count; ++i)
+      put_pattern(*cache, pool, i, round, value_bytes,
+                  i % 2 == 0 ? nivo::Duration(std::chrono::milliseconds{300}) : nivo::Duration(0));
+    const Sample loaded = sample(*cache, "loaded", round);
+    require(wait_for([&] { return cache->stats().reaper.compactions > compactions; }),
+            "Background compaction did not run after reaping");
+    const Sample compacted = sample(*cache, "reaped_and_compacted", round);
+    require(cache->pool_stats(pool).value().indexed_items == count / 2, "Unexpected survivor count");
+    require(compacted.mapped < loaded.mapped * 2 / 3, "Compaction did not release fragmented mappings");
+    // Background compaction must leave nothing a manual pass could still gain.
+    const nivo::CompactionStats repeated = compact_and_measure(*cache, pool, "manual_after_background", round);
+    require(repeated.moved_items == 0 && cache->memory_stats(pool).value().reserved_bytes == compacted.mapped,
+            "Background compaction left work for a manual pass");
+    require(loaded.rss > compacted.rss && loaded.rss - compacted.rss >= (loaded.rss - baseline.rss) / 3,
+            "RSS did not fall after background compaction");
+    for (std::size_t i = 1; i < count; i += 2) {
+      const nivo::Result<nivo::ReadHandle> found = cache->peek(pool, std::to_string(i));
+      const std::byte expected{static_cast<unsigned char>((i + round) % 251 + 1)};
+      require(found.has_value() && found.value().bytes().size() == value_bytes &&
+                  found.value().bytes().front() == expected && found.value().bytes().back() == expected,
+              "Background compaction changed a surviving payload");
+    }
+    require(cache->clear(pool) == nivo::Status::ok, "Clear failed");
+    verify_release(baseline, loaded, sample(*cache, "released", round));
+  }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    require(argc == 2, "Expected one scenario: slabs, pinned, reserve, compaction, or compaction_pinned");
+    require(argc == 2, "Expected one scenario: slabs, pinned, reserve, compaction, compaction_pinned, ttl, or ttl_compaction");
     const std::string_view scenario(argv[1]);
     if (scenario == "slabs") run_items(false);
     else if (scenario == "pinned") run_items(true);
     else if (scenario == "reserve") run_reserve();
     else if (scenario == "compaction") run_compaction(false);
     else if (scenario == "compaction_pinned") run_compaction(true);
+    else if (scenario == "ttl") run_ttl();
+    else if (scenario == "ttl_compaction") run_ttl_compaction();
     else throw std::runtime_error("Unknown RSS scenario");
     std::cout << "PASS " << scenario << '\n';
     return 0;

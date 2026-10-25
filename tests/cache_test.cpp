@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -49,13 +50,15 @@ std::string text(const nivo::ReadHandle& handle) {
   if (b.empty()) return {};
   return {reinterpret_cast<const char*>(b.data()), b.size()};
 }
+// The background reaper is disabled so expiry happens only where a test asks.
+inline constexpr nivo::ReaperConfig no_reaper{.interval = nivo::Duration(0)};
 struct Fixture {
   std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
   std::unique_ptr<nivo::Cache> cache;
   nivo::PoolId pool;
   explicit Fixture(std::size_t capacity = 1024) {
     nivo::Result<std::unique_ptr<nivo::Cache>> result =
-        nivo::Cache::create({.capacity_bytes = capacity * 2, .clock = clock});
+        nivo::Cache::create({.capacity_bytes = capacity * 2, .clock = clock, .reaper = no_reaper});
     CHECK(result);
     cache = std::move(result).value();
     nivo::Result<nivo::PoolId> added =
@@ -1193,7 +1196,8 @@ void compaction_all_pools_share_expiry_cutoff() {
     }
   };
   std::shared_ptr<CountingClock> clock = std::make_shared<CountingClock>();
-  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create({.clock = clock})).value();
+  std::unique_ptr<nivo::Cache> cache =
+      std::move(nivo::Cache::create({.clock = clock, .reaper = no_reaper})).value();
   const nivo::PoolId first = cache->add_pool({"first", 4096}).value();
   const nivo::PoolId second = cache->add_pool({"second", 4096}).value();
   CHECK(cache->put(first, "key", bytes("value"), {.ttl = 10ms}));
@@ -2176,14 +2180,16 @@ struct BlockingClock final : nivo::Clock {
 
 void pool_maintenance_isolation() {
   std::shared_ptr<BlockingClock> clock = std::make_shared<BlockingClock>();
-  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create({.clock = clock})).value();
+  std::unique_ptr<nivo::Cache> cache =
+      std::move(nivo::Cache::create({.clock = clock, .reaper = no_reaper})).value();
   const nivo::PoolId first = cache->add_pool({"first", 4096}).value();
   const nivo::PoolId second = cache->add_pool({"second", 4096}).value();
   CHECK(cache->put(first, "key", bytes("first")));
   CHECK(cache->put(second, "key", bytes("second")));
   clock->armed = true;
-  std::future<nivo::Result<std::size_t>> maintenance = std::async(std::launch::async, [&] {
-    return cache->prune_expired(first);
+  // resize_pool() reads the clock while holding the exclusive pool guard.
+  std::future<nivo::Status> maintenance = std::async(std::launch::async, [&] {
+    return cache->resize_pool(first, 4096);
   });
   const bool entered = clock->wait_until_entered();
   std::future<nivo::Result<nivo::ReadHandle>> independent = std::async(std::launch::async, [&] {
@@ -2195,7 +2201,7 @@ void pool_maintenance_isolation() {
   const bool parallel = independent.wait_for(2s) == std::future_status::ready;
   const bool blocked = same_pool.wait_for(20ms) == std::future_status::timeout;
   clock->release();
-  CHECK(maintenance.get());
+  CHECK(maintenance.get() == Status::ok);
   CHECK(text(independent.get().value()) == "second");
   CHECK(text(same_pool.get().value()) == "first");
   CHECK(entered && parallel && blocked);
@@ -2203,7 +2209,8 @@ void pool_maintenance_isolation() {
 
 void pool_read_does_not_serialize_writes() {
   std::shared_ptr<BlockingClock> clock = std::make_shared<BlockingClock>();
-  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create({.clock = clock})).value();
+  std::unique_ptr<nivo::Cache> cache =
+      std::move(nivo::Cache::create({.clock = clock, .reaper = no_reaper})).value();
   const nivo::PoolId pool = cache->add_pool({"pool", 4096}).value();
   CHECK(cache->put(pool, "reader", bytes("old")));
   clock->armed = true;
@@ -2364,6 +2371,255 @@ void version_source_saturates() {
 
 }  // namespace
 
+// Randomized check of the timing wheel against a reference set, including
+// bounded draining, large jumps and the overflow horizon.
+void expiry_wheel_matches_reference() {
+  using nivo::detail::Entry;
+  using nivo::detail::ExpiryWheel;
+  for (unsigned seed = 1; seed <= 40; ++seed) {
+    std::mt19937_64 random(seed);
+    const std::int64_t base = seed % 4 == 0 ? (std::int64_t{1} << 36) - 5000
+                                            : static_cast<std::int64_t>(random() % 100000);
+    std::vector<Entry> entries(500);
+    std::set<std::size_t> live;
+    ExpiryWheel wheel{nivo::Duration(base)};
+    std::int64_t now = base;
+    for (int step = 0; step < 5000; ++step) {
+      const std::uint64_t operation = random() % 10;
+      if (operation < 5) {
+        const std::size_t index = static_cast<std::size_t>(random() % entries.size());
+        if (live.erase(index) != 0) {
+          wheel.remove(entries[index]);
+          CHECK(entries[index].expiry_slot == nivo::detail::expiry_unlinked);
+          continue;
+        }
+        const std::int64_t spans[] = {64, 5000, 10000000, 1000};
+        const std::uint64_t kind = random() % 5;
+        std::int64_t ttl = static_cast<std::int64_t>(random() % 3) - 1;  // at or before wheel time
+        if (kind < 3) ttl = 1 + static_cast<std::int64_t>(random() % static_cast<std::uint64_t>(spans[kind]));
+        if (kind == 3) ttl = (std::int64_t{1} << 36) + static_cast<std::int64_t>(random() % 1000);
+        entries[index].expires_at = nivo::Duration(now + ttl);
+        wheel.insert(entries[index]);
+        live.insert(index);
+      } else if (operation < 9) {
+        const std::uint64_t jumps[] = {3, 300, 100000, 40000000};
+        now += static_cast<std::int64_t>(random() % jumps[random() % 4]);
+        wheel.advance(nivo::Duration(now));
+        std::size_t limit = random() % 2 ? std::numeric_limits<std::size_t>::max()
+                                         : static_cast<std::size_t>(random() % 50);
+        for (; limit > 0; --limit) {
+          Entry* entry = wheel.pop_pending();
+          if (!entry) break;
+          const std::size_t index = static_cast<std::size_t>(entry - entries.data());
+          CHECK(live.count(index) == 1);
+          if (entry->expires_at.count() <= now) live.erase(index);
+          else wheel.insert(*entry);
+        }
+        // Once pending is drained, nothing that is due may remain hidden.
+        if (!wheel.has_pending())
+          for (std::size_t index : live) CHECK(entries[index].expires_at.count() > now);
+      } else if (!live.empty()) {
+        std::set<std::size_t>::iterator victim = live.begin();
+        std::advance(victim, static_cast<std::ptrdiff_t>(random() % live.size()));
+        wheel.remove(entries[*victim]);
+        live.erase(victim);
+      }
+      CHECK(wheel.size() == live.size());
+    }
+    now += std::int64_t{1} << 40;
+    wheel.advance(nivo::Duration(now));
+    while (Entry* entry = wheel.pop_pending()) {
+      CHECK(entry->expires_at.count() <= now);
+      live.erase(static_cast<std::size_t>(entry - entries.data()));
+    }
+    CHECK(live.empty() && wheel.size() == 0);
+  }
+}
+bool eventually(const std::function<bool()>& condition) {
+  for (int attempt = 0; attempt < 5000; ++attempt) {
+    if (condition()) return true;
+    std::this_thread::sleep_for(1ms);
+  }
+  return false;
+}
+void reaper_reclaims_in_background() {
+  std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
+  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create(
+      {.capacity_bytes = 1 << 20, .clock = clock, .reaper = {.interval = 1ms}})).value();
+  const nivo::PoolId pool = cache->add_pool({"pool", 1 << 20}).value();
+  for (int i = 0; i < 2000; ++i) {
+    const nivo::Duration ttl = i % 2 ? nivo::Duration(0) : nivo::Duration(1 + i % 500);
+    CHECK(cache->put(pool, "k" + std::to_string(i), bytes("value"), {.ttl = ttl}));
+  }
+  nivo::ReadHandle pinned = std::move(cache->find(pool, "k0")).value();
+  CHECK(cache->pool_stats(pool).value().ttl_items == 1000);
+  // Item TTLs follow the cache clock, which is frozen here.
+  CHECK(eventually([&] { return cache->stats().reaper.passes >= 3; }));
+  CHECK(cache->pool_stats(pool).value().counters.expirations == 0);
+  clock->advance(250ms);
+  CHECK(eventually([&] { return cache->pool_stats(pool).value().indexed_items == 1500; }));
+  clock->advance(1s);
+  CHECK(eventually([&] { return cache->pool_stats(pool).value().indexed_items == 1000; }));
+  const nivo::PoolStats stats = cache->pool_stats(pool).value();
+  CHECK(stats.ttl_items == 0 && stats.counters.expirations == 1000);
+  CHECK(cache->stats().reaper.reclaimed == 1000);
+  CHECK(text(pinned) == "value");
+  CHECK(cache->memory_stats(pool).value().retained_kv_bytes == pinned.charge());
+  pinned.reset();
+  CHECK(cache->memory_stats(pool).value().retained_kv_bytes == 0);
+  CHECK(cache->find(pool, "k1"));
+  cache->close();
+}
+void prune_expired_bounded_and_all_pools() {
+  CHECK(nivo::Cache::create({.reaper = {.batch_size = 0}}).status() == Status::invalid_argument);
+  CHECK(nivo::Cache::create({.reaper = {.interval = -1ms}}).status() == Status::invalid_argument);
+  CHECK(nivo::Cache::create({.reaper = {.sleep_slice = -1ms}}).status() == Status::invalid_argument);
+  std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
+  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create(
+      {.capacity_bytes = 1 << 22, .clock = clock, .reaper = no_reaper})).value();
+  const nivo::PoolId a = cache->add_pool({"a", 1 << 21}).value();
+  const nivo::PoolId b = cache->add_pool({"b", 1 << 21}).value();
+  for (int i = 0; i < 3000; ++i) {
+    CHECK(cache->put(a, std::to_string(i), bytes("x"), {.ttl = 10ms}));
+    CHECK(cache->put(b, std::to_string(i), bytes("x"), {.ttl = i < 1000 ? nivo::Duration(10ms) : nivo::Duration(1h)}));
+  }
+  CHECK(cache->prune_expired(a).value() == 0);
+  clock->advance(10ms);
+  std::size_t total = 0;
+  for (int call = 0; call < 100; ++call) {
+    const std::size_t pruned = cache->prune_expired(a, 7).value();
+    CHECK(pruned <= 7);
+    total += pruned;
+  }
+  CHECK(total == 700);
+  CHECK(cache->prune_expired(a).value() == 2300);
+  CHECK(cache->prune_expired().value() == 1000);
+  CHECK(cache->pool_stats(b).value().ttl_items == 2000);
+  // Replacing with a permanent value or erasing keeps TTL tracking exact.
+  CHECK(cache->put(b, "1500", bytes("y")));
+  CHECK(cache->erase(b, "1501") == Status::ok);
+  CHECK(cache->pool_stats(b).value().ttl_items == 1998);
+  clock->advance(2h);
+  CHECK(cache->prune_expired(b).value() == 1998);
+  CHECK(cache->find(b, "1500"));
+  CHECK(cache->put(b, "z", bytes("z"), {.ttl = 1ms}));
+  CHECK(cache->clear(b) == Status::ok);
+  CHECK(cache->pool_stats(b).value().ttl_items == 0);
+  CHECK(cache->put(b, "z", bytes("z"), {.ttl = 1ms}));
+  clock->advance(1ms);
+  CHECK(cache->prune_expired(b).value() == 1);
+  CHECK(cache->stats().reaper.passes == 0);
+  cache->close();
+  CHECK(cache->prune_expired().status() == Status::closed);
+}
+void ttl_tracking_survives_compaction_and_pressure() {
+  std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
+  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create(
+      {.capacity_bytes = 1 << 22, .clock = clock, .reaper = no_reaper})).value();
+  const nivo::PoolId pool = cache->add_pool({"pool", 1 << 22}).value();
+  const std::string value(512, 'v');
+  for (int i = 0; i < 6000; ++i)
+    CHECK(cache->put(pool, std::to_string(i), bytes(value), {.ttl = nivo::Duration(100 + i)}));
+  for (int i = 0; i < 6000; i += 2) CHECK(cache->erase(pool, std::to_string(i)) == Status::ok);
+  CHECK(cache->compact(pool).value().moved_items > 0);
+  nivo::PoolStats stats = cache->pool_stats(pool).value();
+  CHECK(stats.ttl_items == stats.indexed_items);
+  clock->advance(nivo::Duration(100 + 3000));
+  CHECK(cache->prune_expired(pool).value() == 1500);  // odd keys up to 2999
+  stats = cache->pool_stats(pool).value();
+  CHECK(stats.ttl_items == stats.indexed_items && stats.indexed_items == 1500);
+  // Allocation pressure prunes the remaining expired entries before evicting.
+  clock->advance(1h);
+  for (int i = 0; i < 9000; ++i) CHECK(cache->put(pool, "n" + std::to_string(i), bytes(value)));
+  stats = cache->pool_stats(pool).value();
+  CHECK(stats.ttl_items == 0 && stats.counters.expirations == 3000);
+}
+void concurrent_reaping() {
+  std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
+  std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create({.capacity_bytes = 1 << 21,
+      .clock = clock, .reaper = {.interval = 1ms, .batch_size = 16, .work_slice = 1ms,
+                                 .sleep_slice = 1ms}})).value();
+  const nivo::PoolId pool = cache->add_pool({"pool", 1 << 20}).value();
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> threads;
+  for (unsigned id = 0; id < 4; ++id) {
+    threads.emplace_back([&, id] {
+      std::mt19937 random(id);
+      const std::string value(200, 'a');
+      while (!stop.load()) {
+        const std::string key = std::to_string(random() % 4000);
+        const std::uint32_t operation = random() % 8;
+        if (operation < 2) {
+          const nivo::Duration ttl(random() % 3 ? random() % 50 : 0);
+          (void)cache->put(pool, key, bytes(std::string_view(value).substr(0, random() % 200)), {.ttl = ttl});
+        } else if (operation == 2) {
+          (void)cache->erase(pool, key);
+        } else if (operation == 3) {
+          (void)cache->peek(pool, key);
+        } else {
+          (void)cache->find(pool, key);
+        }
+      }
+    });
+  }
+  threads.emplace_back([&] {
+    while (!stop.load()) {
+      clock->advance(1ms);
+      std::this_thread::sleep_for(100us);
+    }
+  });
+  threads.emplace_back([&] {
+    std::mt19937 random(99);
+    while (!stop.load()) {
+      const std::uint32_t operation = random() % 4;
+      if (operation == 0) (void)cache->prune_expired(pool, random() % 20);
+      else if (operation == 1) (void)cache->prune_expired();
+      else if (operation == 2) (void)cache->compact(pool);
+      else (void)cache->resize_pool(pool, (1 << 19) + random() % (1 << 19));
+      std::this_thread::sleep_for(500us);
+    }
+  });
+  std::this_thread::sleep_for(1s);
+  stop = true;
+  for (std::thread& thread : threads) thread.join();
+  CHECK(cache->stats().reaper.reclaimed > 0);
+  clock->advance(1h);
+  (void)cache->prune_expired(pool).value();
+  CHECK(cache->pool_stats(pool).value().ttl_items == 0);
+}
+
+void background_compaction_after_reaping() {
+  CHECK(nivo::Cache::create({.reaper = {.compact_unused_percent = 101}}).status() == Status::invalid_argument);
+  CHECK(nivo::Cache::create({.reaper = {.compact_cooldown = -1ms}}).status() == Status::invalid_argument);
+  // The same interleaved workload, with background compaction off and on.
+  const std::string value(200, 'v');
+  nivo::MemoryStats results[2];
+  for (int enabled = 0; enabled < 2; ++enabled) {
+    std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
+    nivo::ReaperConfig reaper{.interval = 1ms, .compact_unused_percent = enabled ? 30u : 0u,
+                              .compact_min_unused_bytes = 0, .compact_cooldown = nivo::Duration(0)};
+    std::unique_ptr<nivo::Cache> cache = std::move(nivo::Cache::create(
+        {.capacity_bytes = 1 << 23, .clock = clock, .reaper = reaper})).value();
+    const nivo::PoolId pool = cache->add_pool({"pool", 1 << 23}).value();
+    for (int i = 0; i < 20000; ++i) {
+      const nivo::Duration ttl = i % 2 ? nivo::Duration(0) : nivo::Duration(10ms);
+      CHECK(cache->put(pool, std::to_string(i), bytes(value), {.ttl = ttl}));
+    }
+    const nivo::MemoryStats loaded = cache->memory_stats(pool).value();
+    clock->advance(10ms);
+    CHECK(eventually([&] { return cache->pool_stats(pool).value().ttl_items == 0; }));
+    if (enabled) CHECK(eventually([&] { return cache->stats().reaper.compactions >= 1; }));
+    else std::this_thread::sleep_for(20ms);
+    results[enabled] = cache->memory_stats(pool).value();
+    CHECK(results[enabled].kv_bytes * 2 <= loaded.kv_bytes + 64);
+    CHECK(cache->stats().reaper.compactions == (enabled ? 1u : 0u));
+    for (int i = 1; i < 20000; i += 2) CHECK(text(cache->peek(pool, std::to_string(i)).value()) == value);
+    if (!enabled) CHECK(results[enabled].reserved_bytes == loaded.reserved_bytes);
+  }
+  CHECK(results[1].reserved_bytes < results[0].reserved_bytes * 3 / 4);
+  CHECK(results[1].kv_bytes == results[0].kv_bytes);
+}
+
 int main() {
   const std::pair<const char*, std::function<void()>> cases[] = {
     {"index_collision_chain_and_ownership", index_collision_chain_and_ownership},
@@ -2381,6 +2637,12 @@ int main() {
     {"publish_and_snapshot", publish_and_snapshot}, {"write_conditions_and_retry", write_conditions_and_retry},
     {"ttl_boundary_and_publish_time", ttl_boundary_and_publish_time}, {"expiry_maintenance", expiry_maintenance},
     {"allocation_prunes_only_under_pressure", allocation_prunes_only_under_pressure},
+    {"expiry_wheel_matches_reference", expiry_wheel_matches_reference},
+    {"reaper_reclaims_in_background", reaper_reclaims_in_background},
+    {"prune_expired_bounded_and_all_pools", prune_expired_bounded_and_all_pools},
+    {"ttl_tracking_survives_compaction_and_pressure", ttl_tracking_survives_compaction_and_pressure},
+    {"concurrent_reaping", concurrent_reaping},
+    {"background_compaction_after_reaping", background_compaction_after_reaping},
     {"lru_and_peek", lru_and_peek}, {"fifo_policy", fifo_policy},
     {"pins_and_capacity", pins_and_capacity}, {"update_protects_old_key", update_protects_old_key},
     {"eviction_skips_pins", eviction_skips_pins}, {"pool_isolation_resize", pool_isolation_resize},

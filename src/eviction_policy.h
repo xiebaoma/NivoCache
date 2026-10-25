@@ -31,6 +31,12 @@ class EvictionQueue final {
     std::lock_guard<std::mutex> lock(mutex_);
     unlink(entry);
   }
+  // Unlinks a chain of entries detached from the index, linked through
+  // hash_next, under one lock acquisition.
+  void remove_chain(Entry* chain) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (; chain; chain = chain->hash_next) unlink(*chain);
+  }
   // Compaction preserves logical recency and does not count as an access.
   void relocate(Entry& old, Entry& replacement) {
     std::lock_guard<std::mutex> lock(mutex_);
