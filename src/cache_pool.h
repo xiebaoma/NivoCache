@@ -62,11 +62,16 @@ class CachePool final {
     // Upgrade by releasing and reacquiring; capacity/closed must be rechecked.
     std::unique_lock<SharedMutex> maintenance(maintenance_);
     if (closed_) return Status::closed;
-    if (charge <= config_.capacity_bytes) {
-      if (reserve(charge)) return allocate_reserved(key, value_size, charge);
-      prune_locked(clock_->now());
-      if (make_room(config_.capacity_bytes - charge, key) && reserve(charge))
-        return allocate_reserved(key, value_size, charge);
+    try {
+      if (charge <= config_.capacity_bytes) {
+        if (reserve(charge)) return allocate_reserved(key, value_size, charge);
+        prune_locked(clock_->now());
+        if (make_room(config_.capacity_bytes - charge, key) && reserve(charge))
+          return allocate_reserved(key, value_size, charge);
+      }
+    } catch (const std::bad_alloc&) {
+      // Candidate/expiry planning can fail before item storage is allocated.
+      // Completed logical removals remain valid, as with any failed allocation.
     }
     counters_.allocation_failures.fetch_add(1, std::memory_order_relaxed);
     return Status::resource_exhausted;
@@ -99,8 +104,8 @@ class CachePool final {
       draft->version = version;
       draft->expires_at = options.ttl.count() == 0 ? never_expires : now + options.ttl;
       if (old) eviction_.remove(*old);
-      eviction_.insert(*draft);
       retired = slot.replace(*draft);
+      eviction_.insert(*draft);
       if (old) counters_.replacements.fetch_add(1, std::memory_order_relaxed);
       else counters_.inserts.fetch_add(1, std::memory_order_relaxed);
       return Status::ok;
@@ -160,8 +165,12 @@ class CachePool final {
   Status resize(std::size_t capacity) {
     std::unique_lock<SharedMutex> lock(maintenance_);
     if (closed_) return Status::closed;
-    prune_locked(clock_->now());
-    if (!make_room(capacity, {})) return Status::resource_exhausted;
+    try {
+      prune_locked(clock_->now());
+      if (!make_room(capacity, {})) return Status::resource_exhausted;
+    } catch (const std::bad_alloc&) {
+      return Status::resource_exhausted;
+    }
     config_.capacity_bytes = capacity;
     budget_->resize(capacity);
     return Status::ok;
@@ -266,7 +275,7 @@ class CachePool final {
     result.reserved_bytes_before = budget_->stats().reserved_bytes;
     try {
       result.expired_items = prune_locked(now);
-      std::vector<Entry*> entries = eviction_.entries();
+      std::vector<Entry*> entries = index_.entries();
       std::vector<MemoryAllocator::Allocation> allocations;
       std::vector<Entry*> candidates;
       allocations.reserve(entries.size());
@@ -390,18 +399,24 @@ class CachePool final {
   }
   bool make_room(std::size_t target, std::string_view protected_key) {
     if (budget_->used.load(std::memory_order_relaxed) <= target) return true;
-    for (Entry* entry : eviction_.entries(true)) {
-      if (budget_->used.load(std::memory_order_relaxed) <= target) break;
-      if (entry->key != protected_key && entry->references.load(std::memory_order_acquire) == 1) {
-        unlink(*entry);
-        counters_.evictions.fetch_add(1, std::memory_order_relaxed);
-      }
+    VictimSelection selection = eviction_.select_victims();
+    while (budget_->used.load(std::memory_order_relaxed) > target) {
+      const std::optional<EntryId> candidate = selection.next();
+      if (!candidate) break;
+      EntryPtr retired = index_.remove_if(*candidate, [&](Entry& entry) noexcept -> bool {
+        if (entry.key == protected_key || entry.references.load(std::memory_order_acquire) != 1)
+          return false;
+        eviction_.remove(entry);
+        return true;
+      });
+      if (retired) counters_.evictions.fetch_add(1, std::memory_order_relaxed);
+      // Logical removal happened under the stripe lock. Reclaim outside index
+      // and policy locks; only final release reduces the logical byte budget.
     }
     return budget_->used.load(std::memory_order_relaxed) <= target;
   }
   void clear_locked() noexcept {
-    eviction_.clear();
-    index_.clear();
+    index_.clear([this](Entry& entry) noexcept { eviction_.remove(entry); });
   }
 
   // Exclusive callers already block all traffic, so larger batches are fine.
@@ -415,7 +430,7 @@ class CachePool final {
   mutable SharedMutex maintenance_;
   bool closed_ = false;
   CacheIndex index_;
-  EvictionQueue eviction_;
+  EvictionPolicyEngine eviction_;
   AtomicCounters counters_;
   std::atomic<std::size_t> reap_cursor_{0};
   AutoCompaction auto_compaction_;

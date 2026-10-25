@@ -3,6 +3,7 @@
 #include "../src/process_memory.h"
 #include "../src/cache_index.h"
 #include "../src/eviction_policy.h"
+#include "../src/cache_pool.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2127,8 +2128,13 @@ void concurrent_insert_only_and_erase() {
 
 void deferred_recency_and_relocation() {
   std::array<nivo::detail::Entry, 4> entries;
-  nivo::detail::EvictionQueue queue(nivo::EvictionPolicy::lru);
-  for (std::size_t i = 0; i < 3; ++i) queue.insert(entries[i]);
+  nivo::detail::EvictionPolicyEngine queue(nivo::EvictionPolicy::lru);
+  const std::array<std::string_view, 3> keys{"a", "b", "c"};
+  for (std::size_t i = 0; i < 3; ++i) {
+    entries[i].key = keys[i];
+    entries[i].version = i + 1;
+    queue.insert(entries[i]);
+  }
   std::vector<std::thread> readers;
   for (std::size_t i = 0; i < 4; ++i) {
     readers.emplace_back([&] {
@@ -2137,19 +2143,264 @@ void deferred_recency_and_relocation() {
   }
   for (std::thread& reader : readers) reader.join();
   queue.record_access(entries[1]);
+  entries[3].key = entries[0].key;
+  entries[3].version = entries[0].version;
   queue.relocate(entries[0], entries[3]);
-  const std::vector<nivo::detail::Entry*> ordered = queue.entries(true);
-  CHECK(ordered.size() == 3 && ordered[0] == &entries[2] && ordered[1] == &entries[3] &&
-        ordered[2] == &entries[1]);
+  nivo::detail::VictimSelection ordered = queue.select_victims();
+  CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[2]));
+  CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[3]));
+  CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[1]));
+  CHECK(!ordered.next());
   queue.remove(entries[2]);
-  queue.clear();
-  CHECK(queue.entries().empty());
-  nivo::detail::EvictionQueue fifo(nivo::EvictionPolicy::fifo);
+  queue.remove(entries[3]);
+  queue.remove(entries[1]);
+  CHECK(!queue.select_victims().next());
+  nivo::detail::EvictionPolicyEngine fifo(nivo::EvictionPolicy::fifo);
   fifo.insert(entries[0]);
   fifo.insert(entries[1]);
   fifo.record_access(entries[0]);
-  CHECK(fifo.entries(true)[0] == &entries[0]);
-  fifo.clear();
+  CHECK(fifo.select_victims().next() == nivo::detail::CacheIndex::identity(entries[0]));
+  fifo.remove(entries[0]);
+  fifo.remove(entries[1]);
+}
+
+void policy_configuration_and_failed_publication() {
+  Fixture f(64);
+  const std::size_t assigned = f.cache->stats().assigned_bytes;
+  CHECK(f.cache->add_pool({"invalid", 64, static_cast<nivo::EvictionPolicy>(99)}).status() ==
+        Status::invalid_argument);
+  CHECK(f.cache->stats().assigned_bytes == assigned);
+  for (const nivo::EvictionPolicy kind : {nivo::EvictionPolicy::lru, nivo::EvictionPolicy::fifo}) {
+    CHECK(nivo::detail::EvictionPolicyEngine::validate(kind) == Status::ok);
+    nivo::detail::EvictionPolicyEngine policy(kind);
+    CHECK(!policy.select_victims().next());
+    Fixture configured(64);
+    const nivo::PoolId pool = configured.cache->add_pool({"configured", 64, kind}).value();
+    CHECK(configured.cache->put(pool, "a", bytes("aaa")));
+    CHECK(configured.cache->put(pool, "b", bytes("bbb")));
+    CHECK(configured.cache->find(pool, "a"));
+    CHECK(configured.cache->put(pool, "a", bytes("wrong"),
+        {.mode = nivo::WriteMode::insert_only}).status() == Status::already_exists);
+    CHECK(configured.cache->put(pool, "missing", bytes("wrong"),
+        {.mode = nivo::WriteMode::replace_only}).status() == Status::not_found);
+    CHECK(configured.cache->resize_pool(pool, 4) == Status::ok);
+    const std::string_view victim = kind == nivo::EvictionPolicy::lru ? "b" : "a";
+    CHECK(configured.cache->peek(pool, victim).status() == Status::not_found);
+    const nivo::PoolStats stats = configured.cache->pool_stats(pool).value();
+    CHECK(stats.indexed_items == 1 && stats.allocated_bytes == 4);
+    CHECK(stats.counters.inserts == 2 && stats.counters.replacements == 0 && stats.counters.evictions == 1);
+    CHECK(configured.cache->clear(pool) == Status::ok);
+    CHECK(configured.cache->put(pool, "c", bytes("ccc")));
+    CHECK(configured.cache->put(pool, "d", bytes("ddd")));
+    CHECK(configured.cache->peek(pool, "c").status() == Status::not_found);
+  }
+}
+
+void policy_stable_candidates_and_removal_events() {
+  for (const nivo::EvictionPolicy kind : {nivo::EvictionPolicy::lru, nivo::EvictionPolicy::fifo}) {
+    // Stack ownership supplies one reference in addition to index references.
+    std::array<nivo::detail::Entry, 4> entries;
+    nivo::detail::EvictionPolicyEngine policy(kind);
+    nivo::detail::CacheIndex index(8192);
+    std::vector<std::string> keys;
+    for (std::size_t i = 0; keys.size() < 2; ++i) {
+      const std::string key = "candidate-" + std::to_string(i);
+      if (index.bucket_for(key) == 0) keys.push_back(key);
+    }
+    for (std::size_t i = 0; i < 2; ++i) {
+      entries[i].key = keys[i];
+      entries[i].version = i + 1;
+      index.write(entries[i].key, [&](nivo::detail::CacheIndex::Slot& slot) {
+        CHECK(!slot.replace(entries[i]));
+        policy.insert(entries[i]);
+      });
+    }
+    nivo::detail::VictimSelection saved = policy.select_victims();
+    const nivo::detail::EntryId first = *saved.next();
+    CHECK(first == nivo::detail::CacheIndex::identity(entries[0]));
+
+    // Simulate a compaction commit at a different address, with the same ID.
+    entries[2].key = entries[0].key;
+    entries[2].version = entries[0].version;
+    index.write(entries[0].key, [&](nivo::detail::CacheIndex::Slot& slot) {
+      policy.relocate(entries[0], entries[2]);
+      CHECK(&*slot.replace(entries[2]) == &entries[0]);
+    });
+    bool resolved_moved_entry = false;
+    CHECK(!index.remove_if(first, [&](nivo::detail::Entry& entry) {
+      resolved_moved_entry = &entry == &entries[2];
+      return false;  // Core may reject an otherwise valid candidate.
+    }));
+    CHECK(resolved_moved_entry);
+
+    // Replacement is a new object identity, even though its key is unchanged.
+    entries[3].key = entries[2].key;
+    entries[3].version = 3;
+    index.write(entries[2].key, [&](nivo::detail::CacheIndex::Slot& slot) {
+      policy.remove(*slot.get());
+      CHECK(&*slot.replace(entries[3]) == &entries[2]);
+      policy.insert(entries[3]);
+    });
+    bool stale_was_resolved = false;
+    CHECK(!index.remove_if(first, [&](nivo::detail::Entry&) {
+      stale_was_resolved = true;
+      return true;
+    }));
+    CHECK(!stale_was_resolved);
+    const std::uint64_t new_order = entries[3].access_sequence.load();
+    policy.record_access(entries[2]);  // Late access to a retained old version.
+    CHECK(entries[3].access_sequence.load() == new_order);
+    CHECK(entries[2].policy_previous == nullptr && entries[2].policy_next == nullptr);
+
+    const nivo::detail::EntryId second = *saved.next();
+    CHECK(index.remove_if(second, [&](nivo::detail::Entry& entry) {
+      policy.remove(entry);
+      return true;
+    }));
+    // Reuse the exact address and key; stale IDs must still fail (no ABA).
+    entries[1].version = 4;
+    index.write(entries[1].key, [&](nivo::detail::CacheIndex::Slot& slot) {
+      CHECK(!slot.replace(entries[1]));
+      policy.insert(entries[1]);
+    });
+    CHECK(!index.remove_if(second, [](nivo::detail::Entry&) { return true; }));
+    CHECK(!index.remove_if({}, [](nivo::detail::Entry&) { return true; }));
+    CHECK(!saved.next() && !saved.next());
+
+    std::size_t removals = 0;
+    index.clear([&](nivo::detail::Entry& entry) noexcept {
+      policy.remove(entry);
+      ++removals;
+    });
+    CHECK(removals == 2 && index.entries().empty());
+    CHECK(!policy.select_victims().next());
+    for (const nivo::detail::Entry& entry : entries) CHECK(entry.references.load() == 1);
+  }
+}
+
+void policy_selection_outlives_removed_storage() {
+  nivo::detail::CacheIndex index(8192);
+  std::optional<nivo::detail::VictimSelection> saved;
+  {
+    nivo::detail::EvictionPolicyEngine policy(nivo::EvictionPolicy::lru);
+    std::unique_ptr<nivo::detail::Entry> entry = std::make_unique<nivo::detail::Entry>();
+    const std::string key(256, 'k');
+    entry->key = key;
+    entry->version = 1;
+    index.write(key, [&](nivo::detail::CacheIndex::Slot& slot) {
+      CHECK(!slot.replace(*entry));
+      policy.insert(*entry);
+    });
+    saved.emplace(policy.select_victims());
+    index.clear([&](nivo::detail::Entry& removed) noexcept { policy.remove(removed); });
+  }
+  const std::optional<nivo::detail::EntryId> candidate = saved->next();
+  CHECK(candidate.has_value());
+  CHECK(!index.remove_if(*candidate, [](nivo::detail::Entry&) { return true; }));
+  CHECK(!saved->next());
+}
+
+void policy_pins_exhaustion_and_reclamation() {
+  for (const nivo::EvictionPolicy kind : {nivo::EvictionPolicy::lru, nivo::EvictionPolicy::fifo}) {
+    Fixture f(12);
+    const nivo::PoolId pool = f.cache->add_pool({"pinned", 12, kind}).value();
+    nivo::ReadHandle old = std::move(f.cache->put(pool, "a", bytes("old"))).value();
+    nivo::ReadHandle current = std::move(f.cache->put(pool, "a", bytes("new"))).value();
+    nivo::ReadHandle other = std::move(f.cache->put(pool, "b", bytes("bbb"))).value();
+    CHECK(old.version() != current.version());
+    CHECK(f.cache->put(pool, "c", bytes("ccc")).status() == Status::resource_exhausted);
+    CHECK(f.cache->erase(pool, "a") == Status::ok);
+    CHECK(f.cache->memory_stats(pool).value().retained_kv_bytes == 8);
+    CHECK(f.cache->put(pool, "c", bytes("ccc")).status() == Status::resource_exhausted);
+    CHECK(f.cache->pool_stats(pool).value().counters.evictions == 0);
+    CHECK(text(old) == "old" && text(current) == "new");
+    old.reset();
+    nivo::ReadHandle inserted = std::move(f.cache->put(pool, "c", bytes("ccc"))).value();
+    CHECK(f.cache->resize_pool(pool, 4) == Status::resource_exhausted);
+    CHECK(f.cache->pool_stats(pool).value().capacity_bytes == 12);
+    f.cache->close();
+    CHECK(f.cache->pool_stats(pool).value().indexed_items == 0);
+    CHECK(f.cache->memory_stats(pool).value().retained_kv_bytes == 12);
+    current.reset();
+    other.reset();
+    inserted.reset();
+    CHECK(f.cache->memory_stats(pool).value().reserved_bytes == 0);
+  }
+}
+
+void policy_destruction_with_surviving_entry() {
+  for (const nivo::EvictionPolicy kind : {nivo::EvictionPolicy::lru, nivo::EvictionPolicy::fifo}) {
+    std::weak_ptr<nivo::detail::MemoryAllocator> storage;
+    nivo::detail::EntryPtr survivor;
+    {
+      nivo::detail::CachePool pool(1, {"lifetime", 4096, kind},
+          std::make_shared<nivo::detail::Owner>(), std::make_shared<ManualClock>());
+      nivo::Result<nivo::detail::EntryPtr> draft = pool.allocate("a", 3);
+      CHECK(draft);
+      draft.value()->value[0] = std::byte{42};
+      survivor = std::move(pool.publish(draft.value(), {})).value();
+      storage = survivor->budget;
+      CHECK(survivor.use_count() == 2);
+    }
+    CHECK(!storage.expired() && survivor.use_count() == 1);
+    CHECK(survivor->value[0] == std::byte{42});
+    CHECK(survivor->policy_previous == nullptr && survivor->policy_next == nullptr);
+    std::thread release([entry = std::move(survivor)]() mutable { entry.reset(); });
+    release.join();
+    CHECK(storage.expired());
+  }
+}
+
+void policy_compaction_with_concurrent_pressure() {
+  for (const nivo::EvictionPolicy kind : {nivo::EvictionPolicy::lru, nivo::EvictionPolicy::fifo}) {
+    Fixture f(1024 * 1024);
+    const nivo::PoolId pool = f.cache->add_pool({"pressure", 1024 * 1024, kind}).value();
+    nivo::ReadHandle pinned = std::move(f.cache->put(pool, "pinned", bytes(std::string(15000, 'p')))).value();
+    const std::byte* address = pinned.bytes().data();
+    std::atomic<bool> failed{false};
+    std::barrier gate(4);
+    std::vector<std::thread> workers;
+    for (std::size_t worker = 0; worker < 4; ++worker) {
+      workers.emplace_back([&, worker] {
+        gate.arrive_and_wait();
+        try {
+          for (std::size_t i = 0; i < 160; ++i) {
+            const std::string key = "key-" + std::to_string(i % 64);
+            if (worker < 2) {
+              const std::string value(15000, static_cast<char>('a' + worker));
+              nivo::Result<nivo::ReadHandle> result = f.cache->put(pool, key, bytes(value));
+              if (!result) { CHECK(result.status() == Status::resource_exhausted); continue; }
+              std::this_thread::yield();
+              CHECK(text(result.value()) == value);
+            } else if (worker == 2) {
+              nivo::Result<nivo::ReadHandle> result = f.cache->find(pool, key);
+              if (!result) { CHECK(result.status() == Status::not_found); continue; }
+              const std::string value = text(result.value());
+              CHECK(value.size() == 15000 && value.find_first_not_of(value.front()) == std::string::npos);
+              std::this_thread::yield();
+              CHECK(text(result.value()) == value);
+            } else {
+              const Status resized = f.cache->resize_pool(pool, i % 2 ? 1024 * 1024 : 128 * 1024);
+              CHECK(resized == Status::ok || resized == Status::resource_exhausted);
+              CHECK(f.cache->compact(pool));
+              CHECK(pinned.bytes().data() == address && pinned.bytes().front() == std::byte{'p'});
+            }
+          }
+        } catch (...) { failed = true; }
+      });
+    }
+    for (std::thread& worker : workers) worker.join();
+    CHECK(!failed);
+    // Force pressure independently of scheduling, preserving the pinned entry.
+    CHECK(f.cache->resize_pool(pool, pinned.charge()) == Status::ok);
+    const nivo::PoolStats stats = f.cache->pool_stats(pool).value();
+    CHECK(stats.counters.evictions > 0 && stats.indexed_items == 1);
+    CHECK(text(pinned) == std::string(15000, 'p'));
+    CHECK(f.cache->erase(pool, "pinned") == Status::ok);
+    pinned.reset();
+    CHECK(f.cache->clear(pool) == Status::ok);
+    CHECK(f.cache->memory_stats(pool).value().reserved_bytes == 0);
+  }
 }
 
 struct BlockingClock final : nivo::Clock {
@@ -2627,6 +2878,12 @@ int main() {
     {"concurrent_quota_reservations", concurrent_quota_reservations},
     {"concurrent_insert_only_and_erase", concurrent_insert_only_and_erase},
     {"deferred_recency_and_relocation", deferred_recency_and_relocation},
+    {"policy_configuration_and_failed_publication", policy_configuration_and_failed_publication},
+    {"policy_stable_candidates_and_removal_events", policy_stable_candidates_and_removal_events},
+    {"policy_selection_outlives_removed_storage", policy_selection_outlives_removed_storage},
+    {"policy_pins_exhaustion_and_reclamation", policy_pins_exhaustion_and_reclamation},
+    {"policy_destruction_with_surviving_entry", policy_destruction_with_surviving_entry},
+    {"policy_compaction_with_concurrent_pressure", policy_compaction_with_concurrent_pressure},
     {"pool_maintenance_isolation", pool_maintenance_isolation},
     {"pool_read_does_not_serialize_writes", pool_read_does_not_serialize_writes},
     {"concurrent_same_key_snapshots", concurrent_same_key_snapshots},

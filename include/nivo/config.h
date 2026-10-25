@@ -21,6 +21,8 @@ class Clock {
   [[nodiscard]] virtual Duration now() const noexcept = 0;
 };
 
+// Selected per pool at runtime; the choice is fixed for the pool's lifetime.
+// LRU refreshes on every find hit; FIFO orders successful publications only.
 enum class EvictionPolicy { lru, fifo };
 enum class StorageMode { memory, hybrid };  // hybrid is explicitly unsupported in v0.1
 
