@@ -167,6 +167,8 @@ struct TypedCacheConfig {
   CacheConfig cache;  // cache.capacity_bytes is also the pool capacity
   std::string pool_name = "default";
   EvictionPolicy eviction = EvictionPolicy::lru;
+  std::uint64_t eviction_seed = 0;  // as PoolConfig::eviction_seed
+  S3FifoConfig s3_fifo;             // as PoolConfig::s3_fifo
 };
 
 // Type-safe facade over one pool. Use a pool with exactly one TypedCache

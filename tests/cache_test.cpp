@@ -2126,14 +2126,14 @@ void concurrent_insert_only_and_erase() {
   CHECK(f.cache->stats().allocated_bytes == 0);
 }
 
-void deferred_recency_and_relocation() {
+void recency_and_relocation() {
   std::array<nivo::detail::Entry, 4> entries;
   nivo::detail::EvictionPolicyEngine queue(nivo::EvictionPolicy::lru);
   const std::array<std::string_view, 3> keys{"a", "b", "c"};
   for (std::size_t i = 0; i < 3; ++i) {
     entries[i].key = keys[i];
     entries[i].version = i + 1;
-    queue.insert(entries[i]);
+    CHECK(queue.publish(entries[i], nullptr));
   }
   std::vector<std::thread> readers;
   for (std::size_t i = 0; i < 4; ++i) {
@@ -2146,18 +2146,20 @@ void deferred_recency_and_relocation() {
   entries[3].key = entries[0].key;
   entries[3].version = entries[0].version;
   queue.relocate(entries[0], entries[3]);
-  nivo::detail::VictimSelection ordered = queue.select_victims();
-  CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[2]));
-  CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[3]));
-  CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[1]));
-  CHECK(!ordered.next());
+  {
+    nivo::detail::VictimSelection ordered = queue.select_victims();
+    CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[2]));
+    CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[3]));
+    CHECK(ordered.next() == nivo::detail::CacheIndex::identity(entries[1]));
+    CHECK(!ordered.next());
+  }
   queue.remove(entries[2]);
   queue.remove(entries[3]);
   queue.remove(entries[1]);
   CHECK(!queue.select_victims().next());
   nivo::detail::EvictionPolicyEngine fifo(nivo::EvictionPolicy::fifo);
-  fifo.insert(entries[0]);
-  fifo.insert(entries[1]);
+  CHECK(fifo.publish(entries[0], nullptr));
+  CHECK(fifo.publish(entries[1], nullptr));
   fifo.record_access(entries[0]);
   CHECK(fifo.select_victims().next() == nivo::detail::CacheIndex::identity(entries[0]));
   fifo.remove(entries[0]);
@@ -2211,12 +2213,19 @@ void policy_stable_candidates_and_removal_events() {
       entries[i].key = keys[i];
       entries[i].version = i + 1;
       index.write(entries[i].key, [&](nivo::detail::CacheIndex::Slot& slot) {
+        CHECK(policy.publish(entries[i], nullptr));
         CHECK(!slot.replace(entries[i]));
-        policy.insert(entries[i]);
       });
     }
-    nivo::detail::VictimSelection saved = policy.select_victims();
-    const nivo::detail::EntryId first = *saved.next();
+    // IDs stay meaningful after the selection that produced them has ended.
+    nivo::detail::EntryId first;
+    nivo::detail::EntryId second;
+    {
+      nivo::detail::VictimSelection saved = policy.select_victims();
+      first = *saved.next();
+      second = *saved.next();
+      CHECK(!saved.next() && !saved.next());
+    }
     CHECK(first == nivo::detail::CacheIndex::identity(entries[0]));
 
     // Simulate a compaction commit at a different address, with the same ID.
@@ -2237,9 +2246,8 @@ void policy_stable_candidates_and_removal_events() {
     entries[3].key = entries[2].key;
     entries[3].version = 3;
     index.write(entries[2].key, [&](nivo::detail::CacheIndex::Slot& slot) {
-      policy.remove(*slot.get());
+      CHECK(policy.publish(entries[3], slot.get()));
       CHECK(&*slot.replace(entries[3]) == &entries[2]);
-      policy.insert(entries[3]);
     });
     bool stale_was_resolved = false;
     CHECK(!index.remove_if(first, [&](nivo::detail::Entry&) {
@@ -2247,12 +2255,15 @@ void policy_stable_candidates_and_removal_events() {
       return true;
     }));
     CHECK(!stale_was_resolved);
-    const std::uint64_t new_order = entries[3].access_sequence.load();
     policy.record_access(entries[2]);  // Late access to a retained old version.
-    CHECK(entries[3].access_sequence.load() == new_order);
     CHECK(entries[2].policy_previous == nullptr && entries[2].policy_next == nullptr);
+    {
+      nivo::detail::VictimSelection order = policy.select_victims();
+      CHECK(order.next() == nivo::detail::CacheIndex::identity(entries[1]));
+      CHECK(order.next() == nivo::detail::CacheIndex::identity(entries[3]));
+      CHECK(!order.next());
+    }
 
-    const nivo::detail::EntryId second = *saved.next();
     CHECK(index.remove_if(second, [&](nivo::detail::Entry& entry) {
       policy.remove(entry);
       return true;
@@ -2260,12 +2271,11 @@ void policy_stable_candidates_and_removal_events() {
     // Reuse the exact address and key; stale IDs must still fail (no ABA).
     entries[1].version = 4;
     index.write(entries[1].key, [&](nivo::detail::CacheIndex::Slot& slot) {
+      CHECK(policy.publish(entries[1], nullptr));
       CHECK(!slot.replace(entries[1]));
-      policy.insert(entries[1]);
     });
     CHECK(!index.remove_if(second, [](nivo::detail::Entry&) { return true; }));
     CHECK(!index.remove_if({}, [](nivo::detail::Entry&) { return true; }));
-    CHECK(!saved.next() && !saved.next());
 
     std::size_t removals = 0;
     index.clear([&](nivo::detail::Entry& entry) noexcept {
@@ -2278,9 +2288,9 @@ void policy_stable_candidates_and_removal_events() {
   }
 }
 
-void policy_selection_outlives_removed_storage() {
+void policy_candidate_outlives_removed_storage() {
   nivo::detail::CacheIndex index(8192);
-  std::optional<nivo::detail::VictimSelection> saved;
+  std::optional<nivo::detail::EntryId> candidate;
   {
     nivo::detail::EvictionPolicyEngine policy(nivo::EvictionPolicy::lru);
     std::unique_ptr<nivo::detail::Entry> entry = std::make_unique<nivo::detail::Entry>();
@@ -2288,16 +2298,14 @@ void policy_selection_outlives_removed_storage() {
     entry->key = key;
     entry->version = 1;
     index.write(key, [&](nivo::detail::CacheIndex::Slot& slot) {
+      CHECK(policy.publish(*entry, nullptr));
       CHECK(!slot.replace(*entry));
-      policy.insert(*entry);
     });
-    saved.emplace(policy.select_victims());
+    candidate = policy.select_victims().next();
     index.clear([&](nivo::detail::Entry& removed) noexcept { policy.remove(removed); });
   }
-  const std::optional<nivo::detail::EntryId> candidate = saved->next();
   CHECK(candidate.has_value());
   CHECK(!index.remove_if(*candidate, [](nivo::detail::Entry&) { return true; }));
-  CHECK(!saved->next());
 }
 
 void policy_pins_exhaustion_and_reclamation() {
@@ -2877,10 +2885,10 @@ int main() {
     {"index_stripe_parallelism", index_stripe_parallelism},
     {"concurrent_quota_reservations", concurrent_quota_reservations},
     {"concurrent_insert_only_and_erase", concurrent_insert_only_and_erase},
-    {"deferred_recency_and_relocation", deferred_recency_and_relocation},
+    {"recency_and_relocation", recency_and_relocation},
     {"policy_configuration_and_failed_publication", policy_configuration_and_failed_publication},
     {"policy_stable_candidates_and_removal_events", policy_stable_candidates_and_removal_events},
-    {"policy_selection_outlives_removed_storage", policy_selection_outlives_removed_storage},
+    {"policy_candidate_outlives_removed_storage", policy_candidate_outlives_removed_storage},
     {"policy_pins_exhaustion_and_reclamation", policy_pins_exhaustion_and_reclamation},
     {"policy_destruction_with_surviving_entry", policy_destruction_with_surviving_entry},
     {"policy_compaction_with_concurrent_pressure", policy_compaction_with_concurrent_pressure},

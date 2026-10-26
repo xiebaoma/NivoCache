@@ -56,7 +56,9 @@ struct alignas(std::max_align_t) Entry {
   Entry* policy_next = nullptr;
   Entry* expiry_previous = nullptr;
   Entry* expiry_next = nullptr;
-  std::atomic<std::uint64_t> access_sequence{0};
+  // Interpreted only by the pool's eviction policy (see eviction_policy.h).
+  // An unpublished 2Q draft may carry a history hint in the high bit.
+  std::atomic<std::uint64_t> policy_state{0};
 };
 
 static_assert(sizeof(Entry) % alignof(std::max_align_t) == 0);

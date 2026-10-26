@@ -21,9 +21,91 @@ class Clock {
   [[nodiscard]] virtual Duration now() const noexcept = 0;
 };
 
-// Selected per pool at runtime; the choice is fixed for the pool's lifetime.
-// LRU refreshes on every find hit; FIFO orders successful publications only.
-enum class EvictionPolicy { lru, fifo };
+// Capacity-driven eviction, selected per pool and fixed for its lifetime.
+// Only find() hits change recency; W-TinyLFU also counts find() misses for
+// admission. peek(), failed writes and compaction never
+// change policy state. Each successful publication is a new version: the
+// replaced version leaves the policy at once, even while handles still pin it.
+// Pinned entries, unpublished drafts and the key being written are never
+// chosen, so a request fails with resource_exhausted when only they remain.
+//  lru:    evicts the entry least recently found or published. Exact order;
+//          a find moves the entry under the pool's policy lock in O(1).
+//  fifo:   evicts in publication order; finds never change it. Replacing a
+//          key publishes it again, so it becomes the newest entry.
+//  lfu:    evicts the lowest access count, least recently placed among equal
+//          counts. Counts start at 1, saturate at 15 and are all halved after
+//          every 8 finds per entry (at least 64), so old popularity decays.
+//          A replacement keeps the key's current count.
+//  clock:  second-chance approximation of LRU. A find sets a reference bit
+//          without locking; the hand clears set bits and offers clear ones,
+//          sweeping at most twice per eviction. New versions start unreferenced
+//          just behind the hand.
+//  random: uniform among indexed entries; reproducible with eviction_seed.
+//  no_eviction: never evicts. Allocations that do not fit fail with
+//          resource_exhausted and shrinking below the used bytes fails.
+//          Expired entries are still reclaimed under pressure.
+//  sieve:  SIEVE (Zhang et al., NSDI 2024). New keys enter the head of one
+//          FIFO queue and a find only sets a visited bit, without locking or
+//          moving the entry. A persistent hand walks from the tail towards
+//          the head, clearing visited bits and evicting the first unvisited
+//          entry; the hand stays where it stopped and wraps to the tail.
+//  s3_fifo: S3-FIFO (Yang et al., SOSP 2023): small, main and ghost FIFO
+//          queues tuned by S3FifoConfig. A find atomically increments a
+//          capped counter without locking. Queue shares are measured in key
+//          plus value bytes; the ghost queue keeps only key fingerprints.
+//  slru: two LRU segments, with promotion on a probation hit.
+//  two_q: A1in FIFO, bounded A1out history, and Am LRU.
+//  w_tinylfu: Window LRU plus main SLRU with frequency-based admission.
+// For sieve, s3_fifo, slru, two_q and w_tinylfu a replacement keeps the key's
+// queue position and its visited bit or counter; it is a write, not an access.
+enum class EvictionPolicy {
+  lru, fifo, lfu, clock, random, no_eviction, sieve, s3_fifo, slru, two_q, w_tinylfu
+};
+
+// Parameters for EvictionPolicy::s3_fifo, ignored by other policies. The
+// defaults follow the S3-FIFO paper's Algorithm 1.
+struct S3FifoConfig {
+  // The small queue's share of the bytes the policy tracks, 1 to 99.
+  std::uint32_t small_queue_percent = 10;
+  // Ghost capacity in entries, as a percentage of the tracked entry count, so
+  // 90 matches the main queue's share. 0 disables the ghost queue; at most 400.
+  std::uint32_t ghost_queue_percent = 90;
+  // Access counter cap, 1 to 7. The paper uses two bits (3).
+  std::uint32_t max_frequency = 3;
+  // A small-queue tail with at least this count moves to the main queue
+  // (the paper's "freq > 1"), 1 to max_frequency.
+  std::uint32_t promotion_frequency = 2;
+};
+// Segment targets use a share of pool capacity in key plus value bytes,
+// excluding drafts and retired versions pinned by handles. Replacements
+// preserve segment and order unless a larger value forces demotion.
+struct SlruConfig {
+  std::uint32_t protected_percent = 80;  // 1 to 99; remainder is probation
+};
+// Full 2Q: A1in hits remain FIFO; only an A1out history hit enters Am.
+// A1in's target is a share of indexed bytes (it may borrow unused Am space).
+struct TwoQConfig {
+  std::uint32_t a1in_percent = 25;  // 1 to 99
+  // Fixed maximum of 64-bit historical key hashes, no Value or Entry pointers.
+  // Hash collisions can cause false history hits. 0 disables history.
+  std::size_t ghost_capacity = 4096;  // at most 1,048,576
+};
+// Window TinyLFU with a main SLRU and a four-row Count-Min Sketch. All find()
+// requests, including misses, train admission; peek and writes do not. Ties
+// retain the resident victim. This variant uses no Doorkeeper. Window/main
+// byte shares are soft targets: unused space can be borrowed, and an indivisible
+// large entry can exceed the window target. Admission is deferred until allocation
+// pressure; a candidate too large for main remains in window until evicted.
+struct WTinyLfuConfig {
+  std::uint32_t window_percent = 1;  // 1 to 99 of pool capacity in bytes
+  std::uint32_t protected_percent = 80;  // 1 to 99 of main capacity
+  // Power of two, 64 to 1,048,576. Each of four rows has this many 8-byte
+  // atomic epoch/counter cells; storage is fixed at pool creation.
+  std::size_t sketch_width = 16384;
+  // Halve frequencies after this many find requests (at least 8192).
+  // Batched accounting delays an epoch by at most 63 * 64 requests.
+  std::size_t sample_size = 65536;
+};
 enum class StorageMode { memory, hybrid };  // hybrid is explicitly unsupported in v0.1
 
 // Background reclamation of expired entries. Expired entries are never
@@ -80,6 +162,12 @@ struct PoolConfig {
   // even without requests. Trim/clear, resize, compact and close may release
   // them earlier. Startup storage is never replenished automatically.
   Duration initial_reserve_timeout{30000};
+  // Seeds EvictionPolicy::random; zero draws a nondeterministic seed.
+  std::uint64_t eviction_seed = 0;
+  S3FifoConfig s3_fifo;
+  SlruConfig slru;
+  TwoQConfig two_q;
+  WTinyLfuConfig w_tinylfu;
 };
 
 enum class WriteMode { upsert, insert_only, replace_only, compare_exchange };
