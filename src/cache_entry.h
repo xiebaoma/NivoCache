@@ -13,6 +13,15 @@ namespace nivo::detail {
 inline constexpr Duration never_expires = Duration::max();
 inline constexpr std::uint16_t expiry_unlinked = std::numeric_limits<std::uint16_t>::max();
 
+// Scoped to the originating cache/index. Versions are never reused and survive
+// compaction; the hash only routes an identity lookup to the existing bucket.
+// No borrowed key or address is retained, including after removal/replacement.
+struct EntryId {
+  Version version = invalid_version;
+  std::size_t key_hash = 0;
+  bool operator==(const EntryId&) const noexcept = default;
+};
+
 struct Owner {
   // Zero is reserved for invalid versions. Never wrap and reuse a version.
   Version next_version() const noexcept {
@@ -47,7 +56,9 @@ struct alignas(std::max_align_t) Entry {
   Entry* policy_next = nullptr;
   Entry* expiry_previous = nullptr;
   Entry* expiry_next = nullptr;
-  std::atomic<std::uint64_t> access_sequence{0};
+  // Interpreted only by the pool's eviction policy (see eviction_policy.h).
+  // An unpublished 2Q draft may carry a history hint in the high bit.
+  std::atomic<std::uint64_t> policy_state{0};
 };
 
 static_assert(sizeof(Entry) % alignof(std::max_align_t) == 0);

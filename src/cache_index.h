@@ -38,6 +38,10 @@ class CacheIndex final {
   }
   std::size_t bucket_count() const noexcept { return buckets_.size(); }
 
+  static EntryId identity(const Entry& entry) noexcept {
+    return {entry.version, hash(entry.key)};
+  }
+
   EntryPtr find(std::string_view key) const {
     const std::size_t bucket = bucket_for(key);
     std::shared_lock<SharedMutex> lock(stripes_[bucket % stripe_count].mutex);
@@ -129,6 +133,37 @@ class CacheIndex final {
   }
 
   struct Stats { std::size_t items = 0; std::size_t bytes = 0; std::size_t expiring = 0; };
+
+  // Resolve again under the stripe lock: a saved candidate may have moved,
+  // disappeared, or been replaced by a different version of the same key.
+  // The predicate must not reenter the index. It may acquire the policy lock,
+  // following the same stripe -> policy ordering as publication and removal.
+  // The returned pointer adopts the index reference; release it outside locks.
+  template <typename Predicate>
+  EntryPtr remove_if(EntryId id, Predicate&& predicate) {
+    if (id.version == invalid_version) return {};
+    const std::size_t bucket = id.key_hash & (buckets_.size() - 1);
+    Stripe& stripe = stripes_[bucket % stripe_count];
+    std::unique_lock<SharedMutex> lock(stripe.mutex);
+    Entry** link = &buckets_[bucket];
+    while (*link && (*link)->version != id.version) link = &(*link)->hash_next;
+    if (!*link || !predicate(**link)) return {};
+    Slot slot(link, stripe);
+    return slot.remove();
+  }
+
+  // Maintenance-only enumeration, independent of policy membership/ordering.
+  // The caller holds exclusive pool maintenance throughout use of the raw
+  // pointers. Unlike eviction candidates, these must not escape that scope.
+  std::vector<Entry*> entries() const {
+    std::size_t count = 0;
+    for (const Stripe& stripe : stripes_) count += stripe.items;
+    std::vector<Entry*> result;
+    result.reserve(count);
+    for (Entry* head : buckets_)
+      for (Entry* entry = head; entry; entry = entry->hash_next) result.push_back(entry);
+    return result;
+  }
   Stats stats() const {
     Stats result;
     for (const Stripe& stripe : stripes_) {
@@ -183,7 +218,13 @@ class CacheIndex final {
 
   // Pool maintenance prevents concurrent operations while clearing. Separate
   // stripes still protect each chain; destruction happens outside their locks.
-  void clear() noexcept {
+  void clear() noexcept { clear([](Entry&) noexcept {}); }
+
+  // Notify for every logical removal, including clear/close. No allocations or
+  // cache callbacks are allowed in on_remove; physical reclamation follows
+  // outside the stripe lock and may wait for the last external handle.
+  template <typename Function>
+  void clear(Function&& on_remove) noexcept {
     for (std::size_t stripe_id = 0; stripe_id < stripe_count; ++stripe_id) {
       Entry* detached = nullptr;
       {
@@ -193,6 +234,7 @@ class CacheIndex final {
           Entry* entry = std::exchange(buckets_[bucket], nullptr);
           while (entry) {
             Entry* next = entry->hash_next;
+            on_remove(*entry);
             entry->hash_next = detached;
             entry->expiry_previous = entry->expiry_next = nullptr;
             entry->expiry_slot = expiry_unlinked;

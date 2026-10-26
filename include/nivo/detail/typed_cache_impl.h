@@ -45,7 +45,8 @@ TypedCache<K, V, KeyCodecT, ValueCodecT>::TypedCache(TypedCacheConfig config) {
   if (!created) throw CacheError(created.status());
   owned_ = std::move(created).value();
   Result<PoolId> added = owned_->add_pool(
-      {.name = std::move(config.pool_name), .capacity_bytes = capacity, .eviction = config.eviction});
+      {.name = std::move(config.pool_name), .capacity_bytes = capacity, .eviction = config.eviction,
+       .eviction_seed = config.eviction_seed, .s3_fifo = config.s3_fifo});
   if (!added) throw CacheError(added.status());
   cache_ = owned_.get();
   pool_ = added.value();

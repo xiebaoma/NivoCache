@@ -77,6 +77,23 @@ struct Counters {
   std::uint64_t evictions = 0;
   std::uint64_t expirations = 0;
 };
+// Capacity-driven eviction. An attempt is an allocation or pool shrink that is
+// still over budget after expiry cleanup and asks the policy for victims; it
+// succeeds once enough logical capacity is free. A failure leaves the request
+// with resource_exhausted (NoEviction, or only pinned, protected or draft
+// storage left). Counters::evictions counts the entries removed. Ordinary
+// reads never update these figures.
+struct EvictionStats {
+  std::uint64_t attempts = 0;
+  std::uint64_t successes = 0;
+  std::uint64_t failures = 0;
+  // Policy fields of tracked entries (also part of
+  // MemoryStats::entry_metadata_bytes) plus policy-owned side tables.
+  std::size_t policy_metadata_bytes = 0;
+  // Time spent choosing and unlinking victims, measured for every attempt.
+  std::chrono::nanoseconds selection_time{0};
+  std::chrono::nanoseconds max_selection_time{0};
+};
 struct CompactionStats {
   std::size_t pools = 0;
   std::size_t moved_items = 0;
@@ -97,6 +114,7 @@ struct PoolStats {
   std::size_t ttl_items = 0;      // indexed entries with a TTL, expired or not
   Counters counters;
   AllocatorStats allocator;
+  EvictionStats eviction;
 };
 // Background reaper activity. Counters.expirations counts every expiry,
 // including lazy discovery and prune_expired().
@@ -119,6 +137,7 @@ struct CacheStats {
   bool closed = false;
   Counters counters;
   AllocatorStats allocator;
+  EvictionStats eviction;  // summed over pools; max_selection_time is the maximum
   ReaperStats reaper;
 };
 }  // namespace nivo

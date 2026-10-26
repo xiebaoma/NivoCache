@@ -86,6 +86,14 @@ void accumulate(Counters& a, const Counters& b) {
   a.inserts += b.inserts; a.replacements += b.replacements;
   a.erases += b.erases; a.evictions += b.evictions; a.expirations += b.expirations;
 }
+void accumulate(EvictionStats& a, const EvictionStats& b) {
+  a.attempts += b.attempts;
+  a.successes += b.successes;
+  a.failures += b.failures;
+  a.policy_metadata_bytes += b.policy_metadata_bytes;
+  a.selection_time += b.selection_time;
+  a.max_selection_time = std::max(a.max_selection_time, b.max_selection_time);
+}
 void accumulate(AllocatorStats& a, const AllocatorStats& b) {
   a.requested_bytes += b.requested_bytes;
   a.active_bytes += b.active_bytes;
@@ -295,8 +303,9 @@ Result<PoolId> Cache::add_pool(PoolConfig config) {
   if (config.name.empty() || config.capacity_bytes == 0) return Status::invalid_argument;
   if (config.initial_reserve_bytes > config.capacity_bytes || config.initial_reserve_timeout.count() <= 0)
     return Status::invalid_argument;
-  if (config.eviction != EvictionPolicy::lru && config.eviction != EvictionPolicy::fifo)
-    return Status::invalid_argument;
+  const Status policy_status = detail::EvictionPolicyEngine::validate(
+      config.eviction, config.s3_fifo, config.slru, config.two_q, config.w_tinylfu);
+  if (policy_status != Status::ok) return policy_status;
   {
     std::shared_lock<detail::SharedMutex> lock(impl_->registry_mutex);
     for (const Impl::PoolMap::value_type& entry : impl_->pools)
@@ -383,6 +392,7 @@ CacheStats Cache::stats() const {
     result.ttl_items += pool.ttl_items;
     accumulate(result.counters, pool.counters);
     accumulate(result.allocator, pool.allocator);
+    accumulate(result.eviction, pool.eviction);
   }
   return result;
 }

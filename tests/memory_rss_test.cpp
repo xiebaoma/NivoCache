@@ -1,6 +1,7 @@
 #include <nivo/nivo.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -227,8 +228,17 @@ void run_reserve() {
   verify_release(baseline, loaded, released);
 }
 
-std::unique_ptr<nivo::Cache> create_reaping_cache(std::uint32_t compact_unused_percent) {
+// Lets a scenario expire every TTL entry at once, independent of load speed.
+struct ManualClock final : nivo::Clock {
+  std::atomic<nivo::Duration::rep> ticks{0};
+  nivo::Duration now() const noexcept override { return nivo::Duration(ticks.load()); }
+  void advance(nivo::Duration delta) { ticks.fetch_add(delta.count()); }
+};
+
+std::unique_ptr<nivo::Cache> create_reaping_cache(std::uint32_t compact_unused_percent,
+                                                  std::shared_ptr<const nivo::Clock> clock = nullptr) {
   nivo::Result<std::unique_ptr<nivo::Cache>> result = nivo::Cache::create({.capacity_bytes = 256 * mib,
+      .clock = std::move(clock),
       .reaper = {.interval = std::chrono::milliseconds{50},
                  .compact_unused_percent = compact_unused_percent,
                  .compact_cooldown = std::chrono::milliseconds{0}}});
@@ -281,10 +291,13 @@ void run_ttl() {
 
 // Expiring entries interleave with permanent ones, so reaping alone leaves
 // every slab partially live. Background compaction must return the space.
+// The cache clock stays frozen during the load, so all TTL entries expire
+// together; otherwise slow builds compact before the last ones expire.
 void run_ttl_compaction() {
   constexpr std::size_t value_bytes = 4000;
   constexpr std::size_t count = workload_bytes / value_bytes / 2 * 2;
-  std::unique_ptr<nivo::Cache> cache = create_reaping_cache(30);
+  const std::shared_ptr<ManualClock> clock = std::make_shared<ManualClock>();
+  std::unique_ptr<nivo::Cache> cache = create_reaping_cache(30, clock);
   const nivo::PoolId pool = cache->add_pool({.name = "ttl_compaction", .capacity_bytes = 256 * mib}).value();
   for (unsigned round = 1; round <= 3; ++round) {
     const Sample baseline = sample(*cache, "baseline", round);
@@ -293,6 +306,7 @@ void run_ttl_compaction() {
       put_pattern(*cache, pool, i, round, value_bytes,
                   i % 2 == 0 ? nivo::Duration(std::chrono::milliseconds{300}) : nivo::Duration(0));
     const Sample loaded = sample(*cache, "loaded", round);
+    clock->advance(std::chrono::milliseconds{300});
     require(wait_for([&] { return cache->stats().reaper.compactions > compactions; }),
             "Background compaction did not run after reaping");
     const Sample compacted = sample(*cache, "reaped_and_compacted", round);
